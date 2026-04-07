@@ -93,6 +93,10 @@ const MODELS = Dict(
     "voronoivoter"    => VoronoiVoterModel(),
     "cyberopinion"    => CyberspaceOpinionModel(),
     "abtgc"           => ABTgcModel(),
+    # Modeling Commons new candidates
+    "evolutionofnorms"  => EvolutionOfNormsModel(),
+    "lassavirus"        => LassaVirusModel(),
+    "axelrodcultural"   => AxelrodCulturalModel(),
 )
 
 # Models too slow for batch comparison runs (>30s/run)

@@ -42,7 +42,9 @@ export AbstractBenchmarkModel, ComparisonReport, CalibratedReport,
        CropRotationModel, RationalEvolvingPDModel, SearchPathModel,
        BullwhipEffectModel, InfiniteLifeModel, ResilientTeamModel,
        PrivacyOpinionModel, ArtificialEconomyModel, VoronoiVoterModel,
-       CyberspaceOpinionModel, ABTgcModel
+       CyberspaceOpinionModel, ABTgcModel,
+        # Modeling Commons new candidates
+        EvolutionOfNormsModel, LassaVirusModel, AxelrodCulturalModel
 
 using Statistics
 using Printf
@@ -73,12 +75,16 @@ end
 # ── Abstract model protocol ───────────────────────────────────────────
 
 abstract type AbstractBenchmarkModel end
+abstract type FileBenchmarkModel <: AbstractBenchmarkModel end
 
 """Return the full .nlogo file content (code + BehaviorSpace XML)."""
 function nlogo_source end
 
 """Return just the NetLogo code for the Julia runtime."""
 function netlogo_code end
+
+"""Return the backing .nlogo path for file-backed models."""
+function nlogo_path end
 
 """Return the list of global variable names to track each tick."""
 function tracked_globals end
@@ -101,7 +107,71 @@ topology(::AbstractBenchmarkModel) = (true, true)
 """Return NetLogo commands to run before setup (e.g., widget defaults). Default: empty."""
 pre_setup_commands(::AbstractBenchmarkModel) = ""
 
+"""Return the setup procedure name. Default: setup."""
+setup_command(::AbstractBenchmarkModel) = "setup"
+
+"""Return the go procedure name. Default: go."""
+go_command(::AbstractBenchmarkModel) = "go"
+
 const SEP = "@#\$#@#\$#@"
+
+project_root() = normpath(joinpath(@__DIR__, "..", ".."))
+modelingcommons_root() = joinpath(project_root(), "modelingcommons")
+
+function nlogo_sections(source::AbstractString)
+    parts = split(String(source), SEP; keepempty=true)
+    length(parts) >= 11 || error("Source does not look like a full .nlogo model")
+    parts
+end
+
+nlogo_section(source::AbstractString, index::Int) = nlogo_sections(source)[index]
+
+function replace_nlogo_section(source::AbstractString, index::Int, replacement::AbstractString)
+    parts = nlogo_sections(source)
+    parts[index] = "\n" * String(replacement) * "\n"
+    join(parts, SEP)
+end
+
+function full_nlogo_source(model::FileBenchmarkModel)
+    read(nlogo_path(model), String)
+end
+
+function turtle_shapes_text(model::AbstractBenchmarkModel)
+    extra_shapes(model)
+end
+
+function turtle_shapes_text(model::FileBenchmarkModel)
+    strip(nlogo_section(full_nlogo_source(model), 4))
+end
+
+function build_behaviorspace_xml(
+    model::AbstractBenchmarkModel;
+    fixed_seed::Union{Nothing, Int}=nothing,
+    seed_values::Union{Nothing, Vector{Int}}=nothing)
+    metrics = join(["    <metric>$g</metric>" for g in tracked_globals(model)], "\n")
+    metric_block = isempty(metrics) ? "" : metrics * "\n"
+    pre_cmds = strip(pre_setup_commands(model))
+    seed_line = fixed_seed === nothing ? "random-seed randomSeed" : "random-seed $fixed_seed"
+    setup_proc = strip(setup_command(model))
+    setup_block = isempty(pre_cmds) ? "$seed_line\n$setup_proc" : "$pre_cmds\n$seed_line\n$setup_proc"
+    go_proc = strip(go_command(model))
+    seed_block = ""
+    if seed_values !== nothing
+        values = join(["      <value value=\"$seed\"/>" for seed in seed_values], "\n")
+        seed_block = """    <enumeratedValueSet variable="randomSeed">
+$values
+    </enumeratedValueSet>
+"""
+    end
+    """<experiments>
+  <experiment name="benchmark" repetitions="1" runMetricsEveryStep="true">
+    <setup>$(setup_block)</setup>
+    <go>$(go_proc)</go>
+    <timeLimit steps="$(n_ticks(model))"/>
+$(metric_block)$(seed_block)  </experiment>
+</experiments>
+"""
+end
 
 """Build a well-formed .nlogo file with BehaviorSpace experiment."""
 function nlogo_source(model::AbstractBenchmarkModel)
@@ -1142,5 +1212,10 @@ include("models/artificial_economy.jl")
 include("models/voronoi_voter.jl")
 include("models/cyberspace_opinion.jl")
 include("models/abtgc.jl")
+
+# Modeling Commons new candidates
+include("models/evolution_of_norms.jl")
+include("models/lassa_virus.jl")
+include("models/axelrod_cultural.jl")
 
 end # module
