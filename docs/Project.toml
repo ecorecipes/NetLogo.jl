@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+NetLogo = "47cc7e5d-7da3-4641-94e9-7875483e9d6c"
+
+[compat]
+Documenter = "1"
