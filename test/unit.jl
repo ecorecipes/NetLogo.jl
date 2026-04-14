@@ -4135,14 +4135,10 @@ end
   @test breed_error isa NetLogo.LogoRuntimeError
   @test occursin("entire breed", breed_error.message)
 
-  turtle_shape_error = try
-    call!(runtime, "bad-turtle-shape")
-    nothing
-  catch err
-    err
-  end
-  @test turtle_shape_error isa NetLogo.LogoRuntimeError
-  @test occursin("defined turtle shape", turtle_shape_error.message)
+  # NetLogo allows setting shapes that may not be defined;
+  # they fall back to default rendering. No error is thrown.
+  call!(runtime, "bad-turtle-shape")
+  @test runtime.world.turtle_breed_shapes["TURTLES"] == "not-a-shape"
 end
 
 @testset "unit: metadata reporters" begin

@@ -352,6 +352,7 @@ mutable struct ModelSpec
   view_widget::Union{Nothing, ViewWidgetSpec}
   has_interface_section::Bool
   turtle_shapes_text::String
+  source_path::Union{Nothing, String}
 end
 
 const CompiledModel = ModelSpec
@@ -374,7 +375,8 @@ function ModelSpec(source::String)
     Dict{String, Any}(),
     nothing,
     false,
-    "")
+    "",
+    nothing)
 end
 
 function breed_index(breeds::Vector{BreedSpec}, plural::AbstractString)

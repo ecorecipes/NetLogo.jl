@@ -1121,6 +1121,7 @@ function parse_model(
   model = ModelSpec(model_source)
   model.has_interface_section = has_interface_section
   model.turtle_shapes_text = extract_turtle_shapes_section(source)
+  model.source_path = source_path === nothing ? nothing : String(source_path)
   raw_procedures = RawProcedure[]
   extension_specs = Pair{String, SourceSpan}[]
 
@@ -2580,6 +2581,7 @@ function parse_nlogox_model(
   stream = TokenStream(tokenize(code_source))
   model = ModelSpec(source)
   model.has_interface_section = true
+  model.source_path = source_path === nothing ? nothing : String(source_path)
   raw_procedures = RawProcedure[]
   extension_specs = Pair{String, SourceSpan}[]
 

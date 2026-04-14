@@ -93,6 +93,7 @@ mutable struct RuntimeState
   plot_manager::PlotManagerState
   plot_rng::MersenneTwister
   custom_turtle_shapes::Dict{String, Any}
+  model_directory::Union{Nothing, String}
   prepared_arg_buffers::Vector{Vector{Any}}
   prepared_arg_depth::Base.RefValue{Int}
   agent_iteration_buffers::Vector{Vector{AbstractAgent}}
@@ -335,7 +336,16 @@ function create_runtime(
   max_pycor::Union{Nothing, Integer}=nothing,
   topology::Union{Nothing, TopologyMode}=nothing,
   patch_size::Union{Nothing, Real}=nothing,
-  seed::Integer=1)
+  seed::Integer=1,
+  model_directory::Union{Nothing, AbstractString}=nothing)
+  # Auto-derive model_directory from model's source_path if not explicitly provided
+  effective_model_dir = if model_directory !== nothing
+    String(model_directory)
+  elseif model.source_path !== nothing
+    dirname(model.source_path)
+  else
+    nothing
+  end
   world = World(model; min_pxcor=min_pxcor, max_pxcor=max_pxcor, min_pycor=min_pycor, max_pycor=max_pycor, topology=topology, patch_size=patch_size, seed=seed)
   rt = RuntimeState(
     model,
@@ -350,6 +360,7 @@ function create_runtime(
     plot_manager_from_model(model),
     copy(world.rng),
     Dict{String, Any}(),
+    effective_model_dir,
     Vector{Vector{Any}}(),
     Ref(0),
     Vector{Vector{AbstractAgent}}(),
@@ -369,7 +380,7 @@ function load_turtle_shapes!(runtime::RuntimeState, text::AbstractString)
 end
 
 function load_turtle_shapes_file!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   isfile(resolved) || throw(LogoRuntimeError("The file $(resolved) cannot be found"))
   load_turtle_shapes!(runtime, read(resolved, String))
 end
@@ -1096,6 +1107,23 @@ end
 
 resolve_file_path(path::AbstractString) = normpath(abspath(String(path)))
 
+function resolve_file_path(path::AbstractString, runtime::RuntimeState)
+  p = String(path)
+  # If path is already absolute, use it directly
+  if isabspath(p)
+    return normpath(p)
+  end
+  # Try relative to model directory first (NetLogo resolves relative to model file)
+  if runtime.model_directory !== nothing
+    model_relative = normpath(joinpath(runtime.model_directory, p))
+    if ispath(model_relative)
+      return model_relative
+    end
+  end
+  # Fall back to CWD-relative
+  normpath(abspath(p))
+end
+
 function current_file_state(runtime::RuntimeState)
   path = runtime.current_file
   path === nothing && throw(LogoRuntimeError("No file has been opened."))
@@ -1119,7 +1147,7 @@ function close_file_state!(state::RuntimeFileState)
 end
 
 function open_file!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   if !haskey(runtime.open_files, resolved)
     runtime.open_files[resolved] = RuntimeFileState(resolved)
   end
@@ -1549,9 +1577,10 @@ function set_plot_range!(runtime::RuntimeState, min_value, max_value; is_x::Bool
 end
 
 file_exists(path::AbstractString) = ispath(resolve_file_path(path))
+file_exists(path::AbstractString, runtime::RuntimeState) = ispath(resolve_file_path(path, runtime))
 
 function delete_file!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   haskey(runtime.open_files, resolved) &&
     throw(LogoRuntimeError("You need to close the file before deletion"))
   rm(resolved)
@@ -1944,7 +1973,7 @@ end
 function export_plot!(runtime::RuntimeState, plot_name::AbstractString, path::AbstractString)
   index = find_plot(runtime.plot_manager, plot_name)
   index === nothing && throw(LogoRuntimeError("no such plot: \"$(plot_name)\""))
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   open(resolved, "w") do io
     export_plot_header!(io, "plot")
     export_plot_interface_globals!(io)
@@ -1955,7 +1984,7 @@ end
 
 function export_all_plots!(runtime::RuntimeState, path::AbstractString)
   isempty(runtime.plot_manager.plots) && throw(LogoRuntimeError("there are no plots to export"))
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   open(resolved, "w") do io
     export_plot_header!(io, "plots")
     export_plot_interface_globals!(io)
@@ -1970,7 +1999,7 @@ end
 function export_output!(runtime::RuntimeState, path::AbstractString)
   resolved_path = String(path)
   isempty(resolved_path) && throw(LogoRuntimeError("Can't export to empty pathname."))
-  resolved = resolve_file_path(resolved_path)
+  resolved = resolve_file_path(resolved_path, runtime)
   open(resolved, "w") do io
     for line in eachsplit(runtime.output_area, '\n'; keepempty=false)
       println(io, line)
@@ -1980,7 +2009,7 @@ function export_output!(runtime::RuntimeState, path::AbstractString)
 end
 
 function export_world!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   snapshot = WorldPersistenceSnapshot(
     runtime.world,
     current_perspective_subject!(runtime),
@@ -2043,7 +2072,7 @@ function rgba_colorant_image(pixels::AbstractMatrix{<:NTuple{4, <:Real}})
 end
 
 function export_view!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   try
     FileIO.save(resolved, colorant_view_image(runtime))
   catch err
@@ -2053,7 +2082,7 @@ function export_view!(runtime::RuntimeState, path::AbstractString)
 end
 
 function export_drawing!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   drawing = runtime.world.drawing === nothing ? blank_drawing(runtime.world) : runtime.world.drawing
   try
     FileIO.save(resolved, rgba_colorant_image(drawing))
@@ -2064,7 +2093,7 @@ function export_drawing!(runtime::RuntimeState, path::AbstractString)
 end
 
 function import_world!(runtime::RuntimeState, path::AbstractString)
-  resolved = resolve_file_path(path)
+  resolved = resolve_file_path(path, runtime)
   isfile(resolved) || throw(LogoRuntimeError("The file $(resolved) cannot be found"))
   snapshot = open(resolved, "r") do io
     Serialization.deserialize(io)
@@ -2103,8 +2132,8 @@ function image_rgba_channels(pixel::NTuple{4, T}) where {T <: Real}
   Float64(pixel[4])
 end
 
-function load_patch_import_image(path::AbstractString, opname::AbstractString)
-  resolved = resolve_file_path(path)
+function load_patch_import_image(path::AbstractString, opname::AbstractString; runtime::Union{Nothing, RuntimeState}=nothing)
+  resolved = runtime === nothing ? resolve_file_path(path) : resolve_file_path(path, runtime)
   isfile(resolved) || throw(LogoRuntimeError("The file $(resolved) cannot be found"))
   try
     image = FileIO.load(resolved)
@@ -2145,7 +2174,7 @@ function sampled_image_rgba(image, source_x::Float64, source_y::Float64)
 end
 
 function import_patch_colors!(runtime::RuntimeState, path::AbstractString; as_netlogo_colors::Bool=true, opname::AbstractString="import-pcolors")
-  image = load_patch_import_image(path, opname)
+  image = load_patch_import_image(path, opname; runtime=runtime)
   image_height, image_width = size(image, 1), size(image, 2)
   scale_x = world_width(runtime.world) / Float64(image_width)
   scale_y = world_height(runtime.world) / Float64(image_height)
@@ -2203,7 +2232,7 @@ function composite_rgba_over(destination::NTuple{4, Float64}, source::NTuple{4, 
 end
 
 function import_drawing!(runtime::RuntimeState, path::AbstractString; opname::AbstractString="import-drawing")
-  image = load_patch_import_image(path, opname)
+  image = load_patch_import_image(path, opname; runtime=runtime)
   drawing = runtime.world.drawing === nothing ? blank_drawing(runtime.world) : runtime.world.drawing
   image_height, image_width = size(image, 1), size(image, 2)
   target_height, target_width = size(drawing, 1), size(drawing, 2)
@@ -4273,7 +4302,26 @@ function execute_stmt!(context::Context, stmt::CommandCall)
     logical(eval_expr(context, stmt.args[1])) && execute_block!(context, command_block_arg(stmt.args[2]))
     return nothing
   elseif stmt.name == "IFELSE"
-    execute_block!(context, logical(eval_expr(context, stmt.args[1])) ? command_block_arg(stmt.args[2]) : command_block_arg(stmt.args[3]))
+    nargs = length(stmt.args)
+    if nargs == 3
+      execute_block!(context, logical(eval_expr(context, stmt.args[1])) ? command_block_arg(stmt.args[2]) : command_block_arg(stmt.args[3]))
+    else
+      # Variadic ifelse: (ifelse cond1 [block1] cond2 [block2] ... [else-block])
+      # May or may not have a trailing else block (odd number of args = has else)
+      i = 1
+      while i + 1 <= nargs
+        if isodd(nargs) && i == nargs
+          # Trailing else block (no condition)
+          execute_block!(context, command_block_arg(stmt.args[i]))
+          break
+        end
+        if logical(eval_expr(context, stmt.args[i]))
+          execute_block!(context, command_block_arg(stmt.args[i + 1]))
+          break
+        end
+        i += 2
+      end
+    end
     return nothing
   elseif stmt.name == "REPEAT"
     count = Int(floor(numeric(eval_expr(context, stmt.args[1]))))
@@ -6636,15 +6684,16 @@ end
 agentset_display_name(agentset::AgentSet) =
   lowercase(something(agentset.breed, generic_agentset_breed(agentset.kind), agentset_plural_name(agentset.kind)))
 
-function canonical_turtle_shape_name(shape::AbstractString)
+function canonical_turtle_shape_name(shape::AbstractString, runtime::Union{Nothing, RuntimeState}=nothing)
   normalized = lowercase(String(shape))
-  normalized in DEFAULT_SHAPE_NAMES || throw(LogoRuntimeError("\"$shape\" is not a defined turtle shape"))
+  # Accept any shape name — NetLogo allows shapes that may not be defined;
+  # they simply fall back to default rendering.
   normalized
 end
 
-function canonical_link_shape_name(shape::AbstractString)
+function canonical_link_shape_name(shape::AbstractString, runtime::Union{Nothing, RuntimeState}=nothing)
   normalized = lowercase(String(shape))
-  normalized in DEFAULT_LINK_SHAPE_NAMES || throw(LogoRuntimeError("\"$shape\" is not a defined link shape"))
+  # Accept any link shape name — NetLogo is permissive about link shapes.
   normalized
 end
 
@@ -8025,7 +8074,23 @@ function build_default_registry()
   register_primitive!(registry, "IFELSE", COMMAND,
     command_syntax(right=[BooleanType, CommandBlockType, CommandBlockType], arg_modes=[:eval, :block, :block]),
     function (ctx, args)
-      execute_block!(ctx, logical(args[1]) ? args[2] : args[3])
+      nargs = length(args)
+      if nargs == 3
+        execute_block!(ctx, logical(args[1]) ? args[2] : args[3])
+      else
+        i = 1
+        while i + 1 <= nargs
+          if isodd(nargs) && i == nargs
+            execute_block!(ctx, args[i])
+            break
+          end
+          if logical(args[i])
+            execute_block!(ctx, args[i + 1])
+            break
+          end
+          i += 2
+        end
+      end
       nothing
     end)
   register_primitive!(registry, "CAREFULLY", COMMAND,
@@ -8818,7 +8883,7 @@ function build_default_registry()
   register_primitive!(registry, "FILE-AT-END?", REPORTER, reporter_syntax(ret=BooleanType),
     (ctx, args) -> current_file_at_end(ctx.runtime))
   register_primitive!(registry, "FILE-EXISTS?", REPORTER, reporter_syntax(right=[StringType], ret=BooleanType),
-    (ctx, args) -> file_exists(String(args[1])))
+    (ctx, args) -> file_exists(String(args[1]), ctx.runtime))
   register_primitive!(registry, "FILE-READ", REPORTER, reporter_syntax(ret=WildcardType),
     function (ctx, args)
       try
@@ -8904,7 +8969,16 @@ function build_default_registry()
   register_primitive!(registry, "PLOT-Y-MAX", REPORTER, reporter_syntax(ret=NumberType, agent_classes="OTPL"),
     (ctx, args) -> plot_y_max(ctx.runtime))
   register_primitive!(registry, "SHAPES", REPORTER, reporter_syntax(ret=ListType),
-    (ctx, args) -> Any[DEFAULT_SHAPE_NAMES...])
+    (ctx, args) -> begin
+      all_shapes = Set{String}(DEFAULT_SHAPE_NAMES)
+      for k in keys(ctx.runtime.custom_turtle_shapes)
+        push!(all_shapes, lowercase(k))
+      end
+      delete!(all_shapes, "default")
+      result = Any["default"]
+      append!(result, sort!(collect(all_shapes)))
+      result
+    end)
   register_primitive!(registry, "LINK-SHAPES", REPORTER, reporter_syntax(ret=ListType),
     (ctx, args) -> Any["default"])
   register_primitive!(registry, "NETLOGO-VERSION", REPORTER, reporter_syntax(ret=StringType),
