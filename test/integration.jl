@@ -1219,7 +1219,7 @@ end
     set range-map-three (map range [10] [40] [2])
     set range-zero-step ""
     set range-too-many ""
-    carefully [ set range-zero-step range 0 5 0 ] [ set range-zero-step error-message ]
+    carefully [ set range-zero-step (range 0 5 0) ] [ set range-zero-step error-message ]
     carefully [ set range-too-many (map range [10] [40] [2] [0]) ] [ set range-too-many error-message ]
   end
   """); seed=1)

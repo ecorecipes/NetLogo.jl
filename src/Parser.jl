@@ -1353,6 +1353,10 @@ function parse_statement(stream::TokenStream, model::ModelSpec, registry::Primit
 
   spec = get_command(registry, name)
   if spec !== nothing
+    # Destructuring let: let [var1 var2 ...] expr
+    if name == "LET" && check(stream, LBracketToken)
+      return parse_destructuring_let(stream, token, model, registry, scope)
+    end
     args = parse_call_arguments(
       stream, spec.syntax, model, registry, scope;
       expression_min_precedence=0,
@@ -1415,6 +1419,25 @@ function parse_statement(stream::TokenStream, model::ModelSpec, registry::Primit
   dynamic_link_command !== nothing && return dynamic_link_command
 
   throw(Diagnostic("unknown command $(token.lexeme)", token.span))
+end
+
+# Parse `let [var1 var2 ...] expr` — destructuring let (NetLogo 7 syntax).
+# Emits a synthetic LET-DESTRUCTURE command with SymbolArg names + the value expression.
+function parse_destructuring_let(stream::TokenStream, let_token::Token, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
+  expect!(stream, LBracketToken, "expected '[' for destructuring let")
+  names = String[]
+  while !check(stream, RBracketToken)
+    skip_newlines!(stream)
+    check(stream, RBracketToken) && break
+    t = expect!(stream, IdentifierToken, "expected variable name in destructuring let")
+    push!(names, canonical_name(t.lexeme))
+  end
+  expect!(stream, RBracketToken, "expected ']' to end destructuring let names")
+  skip_newlines!(stream)
+  value = parse_expression(stream, model, registry, scope, 0)
+  args = Any[SymbolArg.(names, Ref(let_token.span))..., value]
+  bindings = names
+  return CommandCall("LET-DESTRUCTURE", args, span_union(let_token.span, spanof(value))), bindings
 end
 
 function parse_foreach_statement(stream::TokenStream, token::Token, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
@@ -1581,6 +1604,16 @@ function parse_argument(
       # Accept string literals in symbol position (e.g., gis:apply-raster r "elevation")
       advance!(stream)
       return SymbolArg(canonical_name(token.lexeme), token.span)
+    end
+    # Handle identifiers starting with '-' (e.g., let -s "")
+    if token.kind == OperatorToken && token.lexeme == "-"
+      next_idx = stream.index + 1
+      if next_idx <= length(stream.tokens) && stream.tokens[next_idx].kind == IdentifierToken
+        advance!(stream)  # consume '-'
+        ident = advance!(stream)  # consume identifier
+        combined = "-" * ident.lexeme
+        return SymbolArg(canonical_name(combined), span_union(token.span, ident.span))
+      end
     end
     token = expect!(stream, IdentifierToken, "expected identifier")
     return SymbolArg(canonical_name(token.lexeme), token.span)
@@ -2066,6 +2099,17 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
       parse_reporter_block(stream, model, registry, scope) :
       parse_list_literal(stream, model, registry, scope)
   elseif token.kind == OperatorToken && token.lexeme == "-"
+    # Check if -identifier is a variable name in scope (e.g., let -s "")
+    next_idx = stream.index + 1
+    if next_idx <= length(stream.tokens) && stream.tokens[next_idx].kind == IdentifierToken
+      combined = "-" * stream.tokens[next_idx].lexeme
+      cname = canonical_name(combined)
+      if identifier_is_variable_like(cname, model, scope)
+        advance!(stream)  # consume '-'
+        ident = advance!(stream)  # consume identifier
+        return VariableRef(cname, span_union(token.span, ident.span), false)
+      end
+    end
     advance!(stream)
     expr = parse_expression(stream, model, registry, scope, PrefixPrecedence)
     return UnaryExpr("-", expr, span_union(token.span, spanof(expr)))

@@ -1809,19 +1809,19 @@ end
   end
 
   to-report range-map-two
-    report map range [10] [20]
+    report (map range [10] [20])
   end
 
   to-report range-map-three
-    report map range [10] [40] [2]
+    report (map range [10] [40] [2])
   end
 
   to-report range-zero-step
-    report range 0 5 0
+    report (range 0 5 0)
   end
 
   to-report range-too-many
-    report map range [10] [40] [2] [0]
+    report (map range [10] [40] [2] [0])
   end
   """; seed=281)
 
@@ -4533,11 +4533,11 @@ end
   end
 
   to-report same-breed-turtle-set
-    report turtle-set frogs turtle 0
+    report (turtle-set frogs turtle 0)
   end
 
   to-report mixed-turtle-set
-    report turtle-set frogs mice
+    report (turtle-set frogs mice)
   end
 
   to-report nested-turtle-whos

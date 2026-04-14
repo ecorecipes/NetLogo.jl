@@ -4253,6 +4253,19 @@ function execute_stmt!(context::Context, stmt::CommandCall)
     haskey(scope, name) && throw(LogoRuntimeError("There is already a local variable here called $(name)"))
     scope[name] = eval_expr(context, stmt.args[2])
     return nothing
+  elseif stmt.name == "LET-DESTRUCTURE"
+    # Destructuring let: args = [SymbolArg(name1), ..., SymbolArg(nameN), value_expr]
+    scope = current_scope(context)
+    values = eval_expr(context, stmt.args[end])
+    values isa AbstractVector || throw(LogoRuntimeError("let destructuring expected a list value"))
+    num_names = length(stmt.args) - 1
+    length(values) == num_names || throw(LogoRuntimeError("let destructuring expected $(num_names) values but got $(length(values))"))
+    for i in 1:num_names
+      name = symbol_arg_name(stmt.args[i])
+      haskey(scope, name) && throw(LogoRuntimeError("There is already a local variable here called $(name)"))
+      scope[name] = values[i]
+    end
+    return nothing
   elseif stmt.name == "SET"
     assign_variable!(context, symbol_arg_name(stmt.args[1]), eval_expr(context, stmt.args[2]))
     return nothing
@@ -6580,6 +6593,10 @@ function validate_runtime_syntax!(stmt::CommandCall, model::ModelSpec, registry:
   end
   if stmt.name == "LET" && !isempty(stmt.args) && stmt.args[1] isa SymbolArg
     push!(scope, stmt.args[1].name)
+  elseif stmt.name == "LET-DESTRUCTURE"
+    for i in 1:length(stmt.args)-1
+      stmt.args[i] isa SymbolArg && push!(scope, stmt.args[i].name)
+    end
   end
   nothing
 end
@@ -8587,7 +8604,7 @@ function build_default_registry()
   register_primitive!(registry, "STANDARD-DEVIATION", REPORTER, reporter_syntax(right=[ListType], ret=NumberType),
     (ctx, args) -> aggregate_standard_deviation(args[1]))
   register_primitive!(registry, "MAP", REPORTER,
-    reporter_syntax(right=[WildcardType, ListType | RepeatableType], ret=ListType, arg_modes=[:reporter_task, :eval]),
+    reporter_syntax(right=[WildcardType, ListType | RepeatableType], ret=ListType, arg_modes=[:reporter_task, :eval], default_count=2),
     (ctx, args) -> map_values(ctx, args[1], args[2:end]...))
   register_primitive!(registry, "FILTER", REPORTER,
     reporter_syntax(right=[WildcardType, ListType], ret=ListType, arg_modes=[:reporter_task, :eval]),
@@ -8721,7 +8738,7 @@ function build_default_registry()
     (ctx, args) -> Any[args...])
   register_primitive!(registry, "MODES", REPORTER, reporter_syntax(right=[ListType], ret=ListType),
     (ctx, args) -> collection_modes(args[1]))
-  register_primitive!(registry, "RANGE", REPORTER, reporter_syntax(right=[NumberType | RepeatableType], ret=ListType),
+  register_primitive!(registry, "RANGE", REPORTER, reporter_syntax(right=[NumberType | RepeatableType], ret=ListType, default_count=1),
     (ctx, args) -> range_values(args))
   register_primitive!(registry, "SENTENCE", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=ListType, default_count=2),
     function (ctx, args)
@@ -8756,11 +8773,11 @@ function build_default_registry()
     (ctx, args) -> begin lst = Any[args[1]]; append!(lst, args[2]); lst end)
   register_primitive!(registry, "LPUT", REPORTER, reporter_syntax(right=[WildcardType, ListType], ret=ListType),
     (ctx, args) -> begin lst = Any[args[2]...]; push!(lst, args[1]); lst end)
-  register_primitive!(registry, "TURTLE-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=TurtlesetType),
+  register_primitive!(registry, "TURTLE-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=TurtlesetType, default_count=1),
     (ctx, args) -> build_agentset("TURTLE-SET", ctx.runtime.model, TurtleKind, args...))
-  register_primitive!(registry, "PATCH-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=PatchsetType),
+  register_primitive!(registry, "PATCH-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=PatchsetType, default_count=1),
     (ctx, args) -> build_agentset("PATCH-SET", ctx.runtime.model, PatchKind, args...))
-  register_primitive!(registry, "LINK-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=LinksetType),
+  register_primitive!(registry, "LINK-SET", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=LinksetType, default_count=1),
     (ctx, args) -> build_agentset("LINK-SET", ctx.runtime.model, LinkKind, args...))
   register_primitive!(registry, "N-OF", REPORTER, reporter_syntax(right=[NumberType, AgentsetType | ListType], ret=WildcardType),
     (ctx, args) -> n_of(ctx.runtime.world.rng, args[1], args[2]))
