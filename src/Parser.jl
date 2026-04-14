@@ -10,7 +10,7 @@ const BUILTIN_LINK_VARS = Set([
 const BUILTIN_VARIABLE_NAMES = union(BUILTIN_TURTLE_VARS, BUILTIN_PATCH_VARS, BUILTIN_LINK_VARS)
 
 is_identifier_start(c::Char) = isletter(c) || c == '_'
-is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'')
+is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'', '%')
 
 decode_logo_string_escape(c::Char) =
   c == '"' ? '"' :
@@ -100,7 +100,16 @@ function tokenize(source::String)
       push!(tokens, Token(StringToken, value, value, span_at(start_i, i, start_line, start_column)))
       i += 1
       column += 1
-    elseif isdigit(c)
+    elseif isdigit(c) || (c == '.' && i < length(chars) && isdigit(chars[i + 1]))
+      while i <= length(chars) && (isdigit(chars[i]) || chars[i] == '.')
+        i += 1
+        column += 1
+      end
+      lexeme = join(chars[start_i:i - 1])
+      push!(tokens, Token(NumberToken, lexeme, parse(Float64, lexeme), span_at(start_i, i - 1, start_line, start_column)))
+    elseif c == '-' && i < length(chars) && (isdigit(chars[i + 1]) || (chars[i + 1] == '.' && i + 1 < length(chars) && isdigit(chars[i + 2])))
+      # Negative number literal: -N or -.N (no space between - and digit)
+      i += 1; column += 1  # skip past '-'
       while i <= length(chars) && (isdigit(chars[i]) || chars[i] == '.')
         i += 1
         column += 1
@@ -360,6 +369,31 @@ function parse_dynamic_link_relation_reporter(
   ReporterCall("LINK-BREED-RELATION", Any[SymbolArg(breed.plural, token.span), SymbolArg(mode, token.span), arg], span_union(token.span, spanof(arg)))
 end
 
+function parse_dynamic_link_neighbor_reporter(
+  name::String,
+  token::Token,
+  stream::TokenStream,
+  model::ModelSpec,
+  registry::PrimitiveRegistry,
+  scope::Set{String})
+  breed = nothing
+  mode = nothing
+  if startswith(name, "IN-") && endswith(name, "-NEIGHBOR?")
+    breed = link_breed_by_singular(model, name[4:end - 10])
+    mode = "IN"
+  elseif startswith(name, "OUT-") && endswith(name, "-NEIGHBOR?")
+    breed = link_breed_by_singular(model, name[5:end - 10])
+    mode = "OUT"
+  elseif endswith(name, "-NEIGHBOR?")
+    breed = link_breed_by_singular(model, name[1:end - 10])
+    mode = "ALL"
+  end
+  breed === nothing && return nothing
+  advance!(stream)
+  arg = parse_expression(stream, model, registry, scope, PrefixPrecedence)
+  ReporterCall("LINK-BREED-NEIGHBOR?", Any[SymbolArg(breed.plural, token.span), SymbolArg(mode, token.span), arg], span_union(token.span, spanof(arg)))
+end
+
 function parse_dynamic_turtle_on_reporter(
   name::String,
   token::Token,
@@ -479,6 +513,11 @@ function split_model_sections(source::String)
   code_source = String(sections[1])
   interface_source = length(sections) >= 2 ? String(sections[2]) : ""
   code_source, interface_source, length(sections) >= 2
+end
+
+function extract_turtle_shapes_section(source::String)
+  sections = split(source, MODEL_SECTION_DELIMITER)
+  length(sections) >= 4 ? strip(String(sections[4])) : ""
 end
 
 function parse_interface_number(::Type{T}, value::AbstractString, description::AbstractString) where {T<:Number}
@@ -1046,6 +1085,9 @@ function parse_model(
   registry::PrimitiveRegistry;
   source_path::Union{Nothing, AbstractString}=nothing,
   extension_host::Module=Main)
+  if is_nlogox_source(source)
+    return parse_nlogox_model(source, registry; source_path=source_path, extension_host=extension_host)
+  end
   code_source, interface_source, has_interface_section = split_model_sections(source)
   include_specs = collect_model_include_specs(code_source)
   if source_path === nothing
@@ -1065,6 +1107,7 @@ function parse_model(
   stream = TokenStream(tokenize(code_source))
   model = ModelSpec(model_source)
   model.has_interface_section = has_interface_section
+  model.turtle_shapes_text = extract_turtle_shapes_section(source)
   raw_procedures = RawProcedure[]
   extension_specs = Pair{String, SourceSpan}[]
 
@@ -1280,14 +1323,14 @@ function parse_call_arguments(
     bare_mask = strip_flags(mask)
     mode = effective_arg_mode(mask, syntax.arg_modes[index])
     if is_repeatable(mask)
-      while can_start_argument(stream, bare_mask)
+      while can_start_argument(stream, bare_mask, model, registry)
         push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
         check(stream, NewlineToken) && break
         skip_newlines!(stream)
       end
       continue
     end
-    if is_optional(mask) && !can_start_argument(stream, bare_mask)
+    if is_optional(mask) && !can_start_argument(stream, bare_mask, model, registry)
       continue
     end
     push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
@@ -1295,7 +1338,9 @@ function parse_call_arguments(
   args
 end
 
-function can_start_argument(stream::TokenStream, mask::Int)
+function can_start_argument(stream::TokenStream, mask::Int,
+                            model::Union{ModelSpec,Nothing}=nothing,
+                            registry::Union{PrimitiveRegistry,Nothing}=nothing)
   token = peek(stream)
   if compatible(mask, ReporterBlockType)
     return token.kind == LBracketToken
@@ -1304,8 +1349,27 @@ function can_start_argument(stream::TokenStream, mask::Int)
   elseif compatible(mask, CommandBlockType)
     return token.kind == LBracketToken
   elseif compatible(mask, SymbolType)
-    return token.kind == IdentifierToken
+    return token.kind == IdentifierToken || token.kind == StringToken
   else
+    # For scalar types (NumberType, BooleanType, StringType) that are not
+    # also list/agentset/agent-compatible, '[' cannot start a valid value.
+    # This prevents optional NumberType args from consuming command blocks.
+    if token.kind == LBracketToken && !compatible(mask, ListType) &&
+       !compatible(mask, AgentsetType) && !compatible(mask, AgentType)
+      return false
+    end
+    # For optional scalar args, reject identifiers that are known commands.
+    # This prevents optional NumberType args from consuming the next statement.
+    if token.kind == IdentifierToken && model !== nothing && registry !== nothing
+      name = canonical_name(token.lexeme)
+      if get_command(registry, name) !== nothing
+        return false
+      end
+      proc = get(model.procedures, name, nothing)
+      if proc !== nothing && !proc.is_reporter
+        return false
+      end
+    end
     return can_start_expression(token)
   end
 end
@@ -1329,6 +1393,12 @@ function parse_argument(
   elseif mode == :block || compatible(mask, CommandBlockType)
     return parse_command_block(stream, model, registry, scope)
   elseif mode == :symbol || compatible(mask, SymbolType)
+    token = peek(stream)
+    if token.kind == StringToken
+      # Accept string literals in symbol position (e.g., gis:apply-raster r "elevation")
+      advance!(stream)
+      return SymbolArg(canonical_name(token.lexeme), token.span)
+    end
     token = expect!(stream, IdentifierToken, "expected identifier")
     return SymbolArg(canonical_name(token.lexeme), token.span)
   else
@@ -1555,6 +1625,30 @@ function parse_ifelse_value_call(stream::TokenStream, token::Token, model::Model
   ReporterCall("IFELSE-VALUE", args, span_union(token.span, spanof(last(args))))
 end
 
+function is_content_reporter_block(stream::TokenStream, registry::PrimitiveRegistry)
+  index = stream.index
+  if index > length(stream.tokens) || stream.tokens[index].kind != LBracketToken
+    return false
+  end
+  index += 1
+  while index <= length(stream.tokens) && stream.tokens[index].kind == NewlineToken
+    index += 1
+  end
+  if index > length(stream.tokens)
+    return false
+  end
+  first_token = stream.tokens[index]
+  if first_token.kind == IdentifierToken
+    name = canonical_name(first_token.lexeme)
+    name in ("TRUE", "FALSE", "NOBODY") && return false
+    spec = get_reporter(registry, name)
+    spec !== nothing && return true
+    cmd = get_command(registry, name)
+    cmd !== nothing && return true
+  end
+  false
+end
+
 function is_infix_reporter_block(stream::TokenStream, registry::PrimitiveRegistry)
   depth = 0
   index = stream.index
@@ -1587,13 +1681,72 @@ function is_infix_reporter_block(stream::TokenStream, registry::PrimitiveRegistr
   false
 end
 
+function parse_list_literal_item(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
+  token = peek(stream)
+  if token.kind == NumberToken
+    advance!(stream)
+    return NumberLiteral(Float64(token.value), token.span)
+  elseif token.kind == StringToken
+    advance!(stream)
+    return StringLiteral(String(token.value), token.span)
+  elseif token.kind == LBracketToken
+    return parse_list_literal(stream, model, registry, scope)
+  elseif token.kind == OperatorToken && token.lexeme == "-"
+    advance!(stream)
+    nxt = peek(stream)
+    if nxt.kind == NumberToken
+      advance!(stream)
+      return NumberLiteral(-Float64(nxt.value), span_union(token.span, nxt.span))
+    end
+    throw(Diagnostic("expected number after '-' in list literal", token.span))
+  elseif token.kind == IdentifierToken
+    uname = uppercase(token.lexeme)
+    if uname == "TRUE"
+      advance!(stream)
+      return BoolLiteral(true, token.span)
+    elseif uname == "FALSE"
+      advance!(stream)
+      return BoolLiteral(false, token.span)
+    end
+  end
+  throw(Diagnostic("expected literal value in list (number, string, boolean, or nested list)", token.span))
+end
+
+function starts_list_literal_item(stream::TokenStream)
+  token = peek(stream)
+  token.kind == NumberToken && return true
+  token.kind == StringToken && return true
+  token.kind == LBracketToken && return true
+  if token.kind == OperatorToken && token.lexeme == "-"
+    idx = stream.index + 1
+    return idx <= length(stream.tokens) && stream.tokens[idx].kind == NumberToken
+  end
+  if token.kind == IdentifierToken
+    uname = uppercase(token.lexeme)
+    return uname == "TRUE" || uname == "FALSE"
+  end
+  false
+end
+
 function parse_list_literal(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
   start = expect!(stream, LBracketToken, "expected '['")
   skip_newlines!(stream)
   items = AbstractExpr[]
-  while !check(stream, RBracketToken)
-    push!(items, parse_expression(stream, model, registry, scope, 0))
-    skip_newlines!(stream)
+  if check(stream, RBracketToken)
+    # empty list
+  elseif starts_list_literal_item(stream)
+    # strict literal-only parsing (fixes [-1 -1] → two numbers, not subtraction)
+    while !check(stream, RBracketToken)
+      push!(items, parse_list_literal_item(stream, model, registry, scope))
+      skip_newlines!(stream)
+    end
+  else
+    # fallback: expression parsing (for [list ...] etc. that look like list literals
+    # but actually contain reporter expressions — legacy compatibility)
+    while !check(stream, RBracketToken)
+      push!(items, parse_expression(stream, model, registry, scope, 0))
+      skip_newlines!(stream)
+    end
   end
   stop = expect!(stream, RBracketToken, "expected ']'")
   ListLiteral(items, span_union(start.span, stop.span))
@@ -1631,13 +1784,13 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
       bare_mask = strip_flags(mask)
       mode = effective_arg_mode(mask, modes[index])
       if is_repeatable(mask)
-        while can_start_argument(stream, bare_mask)
+        while can_start_argument(stream, bare_mask, model, registry)
           push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, spec.syntax.precedence + 1))
           check(stream, NewlineToken) && break
           skip_newlines!(stream)
         end
         continue
-      elseif is_optional(mask) && !can_start_argument(stream, bare_mask)
+      elseif is_optional(mask) && !can_start_argument(stream, bare_mask, model, registry)
         continue
       end
       push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, spec.syntax.precedence + 1))
@@ -1702,12 +1855,15 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
   dynamic_link_relation_reporter = parse_dynamic_link_relation_reporter(name, token, stream, model, registry, scope)
   dynamic_link_relation_reporter !== nothing && return dynamic_link_relation_reporter
 
+  dynamic_link_neighbor_reporter = parse_dynamic_link_neighbor_reporter(name, token, stream, model, registry, scope)
+  dynamic_link_neighbor_reporter !== nothing && return dynamic_link_neighbor_reporter
+
   dynamic_link_lookup_reporter = parse_dynamic_link_lookup_reporter(name, token, stream, model, registry, scope)
   dynamic_link_lookup_reporter !== nothing && return dynamic_link_lookup_reporter
 
   if name in scope || name in model.globals || name in BUILTIN_VARIABLE_NAMES || has_turtle_breed(model, name) || has_link_breed(model, name)
     advance!(stream)
-    return VariableRef(name, token.span)
+    return VariableRef(name, token.span, name in scope)
   end
 
   dynamic_link_reporter = parse_dynamic_link_reporter(name, token, model)
@@ -1745,5 +1901,445 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
   end
 
   advance!(stream)
-  VariableRef(name, token.span)
+  VariableRef(name, token.span, false)
+end
+
+# ─── .nlogox (NetLogo 7 XML format) parsing ─────────────────────────────────
+
+function is_nlogox_source(source::String)::Bool
+  s = lstrip(source)
+  startswith(s, "<?xml") || startswith(s, "<model")
+end
+
+function xml_attr(node, name::String, default::String="")
+  haskey(node, name) ? node[name] : default
+end
+
+function xml_attr_int(node, name::String, default::Int=0)
+  haskey(node, name) ? parse(Int, node[name]) : default
+end
+
+function xml_attr_float(node, name::String, default::Float64=0.0)
+  haskey(node, name) ? parse(Float64, node[name]) : default
+end
+
+function xml_attr_bool(node, name::String, default::Bool=false)
+  haskey(node, name) ? lowercase(node[name]) == "true" : default
+end
+
+function xml_text_content(node)
+  buf = IOBuffer()
+  for child in eachnode(node)
+    if EzXML.istext(child) || EzXML.iscdata(child)
+      print(buf, EzXML.nodecontent(child))
+    end
+  end
+  String(take!(buf))
+end
+
+function xml_child_text(parent, tag::String)
+  for child in eachelement(parent)
+    if EzXML.nodename(child) == tag
+      return xml_text_content(child)
+    end
+  end
+  ""
+end
+
+function xml_bounds(node)
+  x = xml_attr_int(node, "x", 0)
+  y = xml_attr_int(node, "y", 0)
+  w = xml_attr_int(node, "width", 100)
+  h = xml_attr_int(node, "height", 100)
+  (x, y, x + w, y + h)
+end
+
+function parse_xml_view(node)
+  x = xml_attr_int(node, "x", 0)
+  y = xml_attr_int(node, "y", 0)
+  w = xml_attr_int(node, "width", 400)
+  h = xml_attr_int(node, "height", 400)
+  ViewWidgetSpec(
+    x, y, x + w, y + h,
+    xml_attr_float(node, "patchSize", 13.0),
+    xml_attr_int(node, "fontSize", 10),
+    xml_attr_bool(node, "wrappingAllowedX", false),
+    xml_attr_bool(node, "wrappingAllowedY", false),
+    xml_attr_int(node, "minPxcor", -16),
+    xml_attr_int(node, "maxPxcor", 16),
+    xml_attr_int(node, "minPycor", -16),
+    xml_attr_int(node, "maxPycor", 16),
+    xml_attr_bool(node, "showTickCounter", true),
+    xml_attr(node, "tickCounterLabel", "ticks"),
+    xml_attr_float(node, "frameRate", 30.0))
+end
+
+function parse_xml_slider(node)
+  left, top, right, bottom = xml_bounds(node)
+  variable = xml_attr(node, "variable", "")
+  SliderWidgetSpec(
+    left, top, right, bottom,
+    xml_attr(node, "display", variable),
+    variable,
+    xml_attr(node, "min", "0"),
+    xml_attr(node, "max", "100"),
+    xml_attr_float(node, "default", 0.0),
+    xml_attr(node, "step", "1"),
+    xml_attr(node, "units", ""),
+    xml_attr(node, "direction", "HORIZONTAL"))
+end
+
+function parse_xml_switch(node)
+  left, top, right, bottom = xml_bounds(node)
+  variable = xml_attr(node, "variable", "")
+  SwitchWidgetSpec(
+    left, top, right, bottom,
+    xml_attr(node, "display", variable),
+    variable,
+    xml_attr_bool(node, "on", false))
+end
+
+function parse_xml_chooser(node)
+  left, top, right, bottom = xml_bounds(node)
+  variable = xml_attr(node, "variable", "")
+  choices = Any[]
+  for child in eachelement(node)
+    if EzXML.nodename(child) == "choice"
+      ctype = xml_attr(child, "type", "string")
+      cval = xml_attr(child, "value", "")
+      if ctype == "number"
+        push!(choices, parse(Float64, cval))
+      elseif ctype == "boolean"
+        push!(choices, lowercase(cval) == "true")
+      else
+        push!(choices, cval)
+      end
+    end
+  end
+  current = xml_attr_int(node, "current", 0)
+  if !isempty(choices)
+    current = clamp(current, 0, length(choices) - 1)
+  end
+  ChooserWidgetSpec(
+    left, top, right, bottom,
+    xml_attr(node, "display", variable),
+    variable,
+    choices,
+    current)
+end
+
+function parse_xml_input(node)
+  left, top, right, bottom = xml_bounds(node)
+  variable = xml_attr(node, "variable", "")
+  value_kind_raw = xml_attr(node, "type", "String")
+  value_kind = uppercase(first(value_kind_raw)) * value_kind_raw[2:end]
+  if value_kind == "Num" || value_kind == "NUMBER"
+    value_kind = "Number"
+  end
+  multiline = xml_attr_bool(node, "multiline", false)
+  raw_value = xml_text_content(node)
+  value_child = nothing
+  for child in eachelement(node)
+    if EzXML.nodename(child) == "value"
+      value_child = xml_text_content(child)
+      break
+    end
+  end
+  raw_str = value_child !== nothing ? value_child : raw_value
+  value::Any =
+    if value_kind == "Number" || value_kind == "Color"
+      isempty(strip(raw_str)) ? 0.0 : parse(Float64, strip(raw_str))
+    else
+      raw_str
+    end
+  InputBoxWidgetSpec(
+    left, top, right, bottom,
+    variable,
+    value,
+    multiline,
+    value_kind)
+end
+
+function parse_xml_monitor(node)
+  left, top, right, bottom = xml_bounds(node)
+  source = strip(xml_text_content(node))
+  MonitorWidgetSpec(
+    left, top, right, bottom,
+    xml_attr(node, "display", ""),
+    source,
+    xml_attr_int(node, "precision", 17),
+    xml_attr_int(node, "fontSize", 11))
+end
+
+function parse_xml_button(node)
+  left, top, right, bottom = xml_bounds(node)
+  source = strip(xml_text_content(node))
+  display = xml_attr(node, "display", "")
+  if isempty(display)
+    display = source
+  end
+  kind_raw = xml_attr(node, "kind", "Observer")
+  kind = uppercase(kind_raw)
+  if !(kind in ("OBSERVER", "TURTLE", "PATCH", "LINK"))
+    kind = "OBSERVER"
+  end
+  ButtonWidgetSpec(
+    left, top, right, bottom,
+    display,
+    source,
+    xml_attr_bool(node, "forever", false),
+    kind,
+    nothing,
+    xml_attr_bool(node, "disableUntilTicks", false))
+end
+
+function parse_xml_pen(node)
+  PlotPenSpec(
+    xml_attr(node, "display", "default"),
+    parse(Int, xml_attr(node, "color", "-16777216")),
+    xml_attr_float(node, "interval", 1.0),
+    xml_attr_int(node, "mode", 0),
+    xml_attr_bool(node, "legend", true),
+    xml_child_text(node, "setup"),
+    xml_child_text(node, "update"))
+end
+
+function parse_xml_plot(node)
+  left, top, right, bottom = xml_bounds(node)
+  pens = PlotPenSpec[]
+  setup_code = ""
+  update_code = ""
+  for child in eachelement(node)
+    tag = EzXML.nodename(child)
+    if tag == "pen"
+      push!(pens, parse_xml_pen(child))
+    elseif tag == "setup"
+      setup_code = xml_text_content(child)
+    elseif tag == "update"
+      update_code = xml_text_content(child)
+    end
+  end
+  auto_plot_x = xml_attr_bool(node, "autoPlotX", true)
+  auto_plot_y = xml_attr_bool(node, "autoPlotY", true)
+  PlotSpec(
+    xml_attr(node, "display", ""),
+    xml_attr(node, "xAxis", ""),
+    xml_attr(node, "yAxis", ""),
+    xml_attr_float(node, "xMin", 0.0),
+    xml_attr_float(node, "xMax", 10.0),
+    xml_attr_float(node, "yMin", 0.0),
+    xml_attr_float(node, "yMax", 10.0),
+    auto_plot_x,
+    auto_plot_y,
+    xml_attr_bool(node, "legend", false),
+    setup_code,
+    update_code,
+    pens)
+end
+
+function parse_xml_note(node)
+  left, top, right, bottom = xml_bounds(node)
+  TextBoxWidgetSpec(
+    left, top, right, bottom,
+    xml_text_content(node),
+    xml_attr_int(node, "fontSize", 12),
+    xml_attr_float(node, "color", 0.0),
+    xml_attr_bool(node, "transparent", true))
+end
+
+function parse_xml_output(node)
+  left, top, right, bottom = xml_bounds(node)
+  OutputWidgetSpec(left, top, right, bottom, xml_attr_int(node, "fontSize", 12))
+end
+
+function xml_turtle_shapes_to_text(shapes_node)
+  buf = IOBuffer()
+  for shape_el in eachelement(shapes_node)
+    EzXML.nodename(shape_el) == "shape" || continue
+    name = xml_attr(shape_el, "name", "default")
+    rotatable = xml_attr(shape_el, "rotatable", "true")
+    editable_idx = xml_attr(shape_el, "editableColorIndex", "0")
+    println(buf, name)
+    println(buf, rotatable)
+    println(buf, editable_idx)
+    for elem in eachelement(shape_el)
+      tag = EzXML.nodename(elem)
+      if tag == "polygon"
+        color = xml_attr(elem, "color", "0")
+        filled = xml_attr(elem, "filled", "true")
+        marked = xml_attr(elem, "marked", "true")
+        points_parts = String[]
+        for pt in eachelement(elem)
+          EzXML.nodename(pt) == "point" || continue
+          push!(points_parts, xml_attr(pt, "x", "0"))
+          push!(points_parts, xml_attr(pt, "y", "0"))
+        end
+        println(buf, "Polygon $color $filled $marked $(join(points_parts, " "))")
+      elseif tag == "circle"
+        color = xml_attr(elem, "color", "0")
+        filled = xml_attr(elem, "filled", "true")
+        marked = xml_attr(elem, "marked", "true")
+        x = xml_attr(elem, "x", "0")
+        y = xml_attr(elem, "y", "0")
+        diameter = xml_attr(elem, "diameter", "0")
+        println(buf, "Circle $color $filled $marked $x $y $diameter")
+      elseif tag == "rectangle"
+        color = xml_attr(elem, "color", "0")
+        filled = xml_attr(elem, "filled", "true")
+        marked = xml_attr(elem, "marked", "true")
+        x1 = xml_attr(elem, "startX", "0")
+        y1 = xml_attr(elem, "startY", "0")
+        x2 = xml_attr(elem, "endX", "0")
+        y2 = xml_attr(elem, "endY", "0")
+        println(buf, "Rectangle $color $filled $marked $x1 $y1 $x2 $y2")
+      elseif tag == "line"
+        color = xml_attr(elem, "color", "0")
+        marked = xml_attr(elem, "marked", "true")
+        sx = xml_attr(elem, "startX", "0")
+        sy = xml_attr(elem, "startY", "0")
+        ex = xml_attr(elem, "endX", "0")
+        ey = xml_attr(elem, "endY", "0")
+        println(buf, "Line $color $marked $sx $sy $ex $ey")
+      end
+    end
+    println(buf)
+  end
+  String(take!(buf))
+end
+
+function parse_nlogox_widgets!(model::ModelSpec, widgets_node)
+  empty!(model.plots)
+  empty!(model.interface_widgets)
+  empty!(model.interface_globals)
+  model.view_widget = nothing
+  for child in eachelement(widgets_node)
+    tag = EzXML.nodename(child)
+    if tag == "view"
+      view = parse_xml_view(child)
+      push!(model.interface_widgets, view)
+      model.view_widget = view
+    elseif tag == "slider"
+      widget = parse_xml_slider(child)
+      push!(model.interface_widgets, widget)
+      register_interface_global!(model, widget)
+    elseif tag == "switch"
+      widget = parse_xml_switch(child)
+      push!(model.interface_widgets, widget)
+      register_interface_global!(model, widget)
+    elseif tag == "chooser"
+      widget = parse_xml_chooser(child)
+      push!(model.interface_widgets, widget)
+      register_interface_global!(model, widget)
+    elseif tag == "input"
+      widget = parse_xml_input(child)
+      push!(model.interface_widgets, widget)
+      register_interface_global!(model, widget)
+    elseif tag == "monitor"
+      push!(model.interface_widgets, parse_xml_monitor(child))
+    elseif tag == "button"
+      push!(model.interface_widgets, parse_xml_button(child))
+    elseif tag == "plot"
+      push!(model.plots, parse_xml_plot(child))
+    elseif tag == "note"
+      push!(model.interface_widgets, parse_xml_note(child))
+    elseif tag == "output"
+      push!(model.interface_widgets, parse_xml_output(child))
+    end
+  end
+  nothing
+end
+
+function parse_nlogox_model(
+  source::String,
+  registry::PrimitiveRegistry;
+  source_path::Union{Nothing, AbstractString}=nothing,
+  extension_host::Module=Main)
+
+  doc = EzXML.parsexml(source)
+  root = EzXML.root(doc)
+
+  # Extract code
+  code_source = ""
+  for child in eachelement(root)
+    if EzXML.nodename(child) == "code"
+      code_source = xml_text_content(child)
+      break
+    end
+  end
+
+  # Handle includes
+  include_specs = collect_model_include_specs(code_source)
+  if source_path !== nothing && !isempty(include_specs)
+    code_source = expand_model_included_code(code_source, source_path; include_specs=include_specs)
+  elseif source_path === nothing && !isempty(include_specs)
+    throw(Diagnostic("Can't resolve __includes without a source path", last(first(include_specs))))
+  end
+
+  stream = TokenStream(tokenize(code_source))
+  model = ModelSpec(source)
+  model.has_interface_section = true
+  raw_procedures = RawProcedure[]
+  extension_specs = Pair{String, SourceSpan}[]
+
+  while !check(stream, EofToken)
+    skip_newlines!(stream)
+    check(stream, EofToken) && break
+    token = expect!(stream, IdentifierToken, "expected a declaration or procedure")
+    name = canonical_name(token.lexeme)
+
+    if name == "GLOBALS"
+      append!(model.globals, parse_identifier_list(stream))
+    elseif name == "TURTLES-OWN"
+      append!(model.turtles_own, parse_identifier_list(stream))
+    elseif name == "PATCHES-OWN"
+      append!(model.patches_own, parse_identifier_list(stream))
+    elseif name == "LINKS-OWN"
+      append!(model.links_own, parse_identifier_list(stream))
+    elseif name == "BREED"
+      parse_breed_declaration!(model, stream; is_link_breed=false, directed=false)
+    elseif name == "DIRECTED-LINK-BREED"
+      parse_breed_declaration!(model, stream; is_link_breed=true, directed=true)
+    elseif name == "UNDIRECTED-LINK-BREED"
+      parse_breed_declaration!(model, stream; is_link_breed=true, directed=false)
+    elseif endswith(name, "-OWN")
+      parse_breed_own_declaration!(model, name, stream, token)
+    elseif name == "EXTENSIONS"
+      specs = parse_extension_name_list(stream)
+      append!(model.extensions, first.(specs))
+      append!(extension_specs, specs)
+    elseif is_include_declaration(name)
+      append!(model.includes, first.(parse_include_path_list(stream)))
+    elseif name == "TO" || name == "TO-REPORT"
+      push!(raw_procedures, parse_raw_procedure!(stream, token))
+    else
+      throw(Diagnostic("unknown top-level form $(token.lexeme)", token.span))
+    end
+    skip_newlines!(stream)
+  end
+
+  load_extensions!(registry, extension_specs; host_module=extension_host)
+
+  for raw in raw_procedures
+    model.procedures[raw.name] = ProcedureSpec(raw.name, raw.is_reporter, raw.inputs, BlockNode(AbstractStmt[], raw.span), raw.span)
+    push!(model.procedure_order, raw.name)
+  end
+
+  # Parse widgets from XML
+  for child in eachelement(root)
+    tag = EzXML.nodename(child)
+    if tag == "widgets"
+      parse_nlogox_widgets!(model, child)
+    elseif tag == "turtleShapes"
+      model.turtle_shapes_text = xml_turtle_shapes_to_text(child)
+    end
+  end
+
+  for raw in raw_procedures
+    body = parse_procedure_body(raw, model, registry)
+    model.procedures[raw.name] = ProcedureSpec(raw.name, raw.is_reporter, raw.inputs, body, raw.span)
+  end
+
+  validate_plot_specs!(model, registry)
+  validate_interface_widgets!(model, registry)
+  model
 end

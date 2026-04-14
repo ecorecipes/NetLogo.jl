@@ -7,6 +7,7 @@ module NetLogo
 
 using Colors
 using Dates
+using EzXML
 using FileIO
 using Random
 using Serialization
@@ -32,6 +33,8 @@ include("ExtMatrix.jl")
 include("ExtStore.jl")
 include("ExtRnd.jl")
 include("ExtTime.jl")
+include("ExtBitstring.jl")
+include("GUI.jl")
 
 @doc raw"""
     SourceSpan
@@ -235,10 +238,12 @@ export AgentKind,
   CompiledModel,
   Context,
   Diagnostic,
+  GUISession,
   HorizontalCylinder,
   Link,
   LogoRuntimeError,
   ModelSpec,
+  NotebookGUI,
   Observer,
   Patch,
   ProcedureSpec,
@@ -250,15 +255,26 @@ export AgentKind,
   Torus,
   Turtle,
   VerticalCylinder,
+  WebGUIBackend,
   call!,
   compile_model,
   create_runtime,
+  gui_session,
+  gui_state,
   load_model,
   load_turtle_shapes!,
+  notebook_gui,
   parse_model,
   parse_turtle_shapes_text,
+  pluto_gui,
+  press_gui_button!,
   register_primitive!,
+  runresult,
+  set_gui_widget!,
+  start_web_gui,
+  stop_web_gui!,
   tokenize,
+  web_gui_url,
   @netlogo_str
 
 compile_model(model::ModelSpec; source_path::Union{Nothing, AbstractString}=nothing) = model
@@ -290,6 +306,16 @@ end
 
 function call!(runtime::RuntimeState, procedure_name::AbstractString, args...)
   call!(runtime, procedure_name, Any[args...])
+end
+
+"""
+    runresult(runtime, expr_string)
+
+Evaluate a NetLogo reporter expression string and return the result.
+"""
+function runresult(runtime::RuntimeState, source::AbstractString)
+  ctx = Context(runtime, runtime.world.observer, EMPTY_SCOPE_STACK, nothing, false, 1, EMPTY_EVERY_STATE)
+  runresult_string(ctx, source)
 end
 
 macro netlogo_str(source)

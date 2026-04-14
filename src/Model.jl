@@ -23,87 +23,160 @@ abstract type AbstractNode end
 abstract type AbstractExpr <: AbstractNode end
 abstract type AbstractStmt <: AbstractNode end
 
-struct NumberLiteral <: AbstractExpr
+mutable struct NumberLiteral <: AbstractExpr
   value::Float64
   span::SourceSpan
 end
 
-struct StringLiteral <: AbstractExpr
+mutable struct StringLiteral <: AbstractExpr
   value::String
   span::SourceSpan
 end
 
-struct BoolLiteral <: AbstractExpr
+mutable struct BoolLiteral <: AbstractExpr
   value::Bool
   span::SourceSpan
 end
 
-struct NobodyLiteral <: AbstractExpr
+mutable struct NobodyLiteral <: AbstractExpr
   span::SourceSpan
 end
 
-struct ListLiteral <: AbstractExpr
+mutable struct ListLiteral <: AbstractExpr
   items::Vector{AbstractExpr}
   span::SourceSpan
 end
 
-struct VariableRef <: AbstractExpr
+mutable struct VariableRef <: AbstractExpr
   name::String
   span::SourceSpan
+  search_locals::Bool
 end
 
-struct UnaryExpr <: AbstractExpr
+VariableRef(name::String, span::SourceSpan) = VariableRef(name, span, false)
+
+mutable struct UnaryExpr <: AbstractExpr
   op::String
   arg::AbstractExpr
   span::SourceSpan
 end
 
-struct SymbolArg <: AbstractNode
+mutable struct SymbolArg <: AbstractNode
   name::String
   span::SourceSpan
 end
 
-struct ReporterCall <: AbstractExpr
-  name::String
-  args::Vector{Any}
-  span::SourceSpan
-end
-
-struct CommandCall <: AbstractStmt
+mutable struct ReporterCall <: AbstractExpr
   name::String
   args::Vector{Any}
   span::SourceSpan
+  cached_prim::Any   # lazily resolved PrimitiveSpec (avoids Dict lookup after first call)
 end
 
-struct BlockNode <: AbstractNode
+ReporterCall(name::String, args::Vector{Any}, span::SourceSpan) =
+  ReporterCall(name, args, span, nothing)
+
+mutable struct CommandCall <: AbstractStmt
+  name::String
+  args::Vector{Any}
+  span::SourceSpan
+  cached_prim::Any   # lazily resolved PrimitiveSpec (avoids Dict lookup after first call)
+end
+
+CommandCall(name::String, args::Vector{Any}, span::SourceSpan) =
+  CommandCall(name, args, span, nothing)
+
+@inline block_creates_scope(statements::Vector{AbstractStmt}) =
+  any(stmt -> stmt isa CommandCall && stmt.name == "LET", statements)
+
+mutable struct BlockNode <: AbstractNode
   statements::Vector{AbstractStmt}
   span::SourceSpan
+  creates_scope::Bool
+  reusable_scope::Bool
+  uses_every::Bool
+  may_stop::Bool
 end
 
-struct CodeBlockNode <: AbstractNode
+BlockNode(statements::Vector{AbstractStmt}, span::SourceSpan) =
+  let creates_scope = block_creates_scope(statements)
+    BlockNode(
+      statements,
+      span,
+      creates_scope,
+      creates_scope && !any(contains_nested_task_literals, statements),
+      any(contains_every_usage, statements),
+      any(contains_stop_usage, statements))
+  end
+
+mutable struct CodeBlockNode <: AbstractNode
   body::Any
   source::String
   span::SourceSpan
 end
 
-struct ReporterBlockNode <: AbstractExpr
+mutable struct ReporterBlockNode <: AbstractExpr
   params::Vector{String}
   expr::AbstractExpr
   span::SourceSpan
+  reusable_frame::Bool
 end
 
-struct CommandTaskNode <: AbstractExpr
+mutable struct CommandTaskNode <: AbstractExpr
   params::Vector{String}
   body::BlockNode
   span::SourceSpan
+  reusable_frame::Bool
 end
 
-struct CallableRefNode <: AbstractExpr
+mutable struct CallableRefNode <: AbstractExpr
   name::String
   span::SourceSpan
 end
 
 spanof(node::AbstractNode) = getfield(node, :span)
+
+contains_nested_task_literals(::Any) = false
+contains_nested_task_literals(node::UnaryExpr) = contains_nested_task_literals(node.arg)
+contains_nested_task_literals(node::ListLiteral) = any(contains_nested_task_literals, node.items)
+contains_nested_task_literals(node::ReporterCall) = any(contains_nested_task_literals, node.args)
+contains_nested_task_literals(node::CommandCall) = any(contains_nested_task_literals, node.args)
+contains_nested_task_literals(node::BlockNode) = any(contains_nested_task_literals, node.statements)
+contains_nested_task_literals(node::CodeBlockNode) = contains_nested_task_literals(node.body)
+contains_nested_task_literals(::ReporterBlockNode) = true
+contains_nested_task_literals(::CommandTaskNode) = true
+
+contains_every_usage(::Any) = false
+contains_every_usage(node::UnaryExpr) = contains_every_usage(node.arg)
+contains_every_usage(node::ListLiteral) = any(contains_every_usage, node.items)
+contains_every_usage(node::ReporterCall) = any(contains_every_usage, node.args)
+contains_every_usage(node::CommandCall) =
+  node.name in ("EVERY", "RUN", "FOREACH", "__APPLY") || any(contains_every_usage, node.args)
+contains_every_usage(node::BlockNode) = node.uses_every
+contains_every_usage(node::CodeBlockNode) = contains_every_usage(node.body)
+contains_every_usage(node::ReporterBlockNode) = contains_every_usage(node.expr)
+contains_every_usage(node::CommandTaskNode) = node.body.uses_every
+
+# Detect whether a block or any nested sub-block may execute `stop`.
+# `stop` inside task literals (anonymous procedures) does NOT propagate out.
+contains_stop_usage(::Any) = false
+contains_stop_usage(node::UnaryExpr) = contains_stop_usage(node.arg)
+contains_stop_usage(node::ListLiteral) = any(contains_stop_usage, node.items)
+contains_stop_usage(node::ReporterCall) = any(contains_stop_usage, node.args)
+contains_stop_usage(node::CommandCall) =
+  node.name == "STOP" || node.name == "RUN" || node.name == "FOREACH" || node.name == "__APPLY" ||
+  any(contains_stop_usage, node.args)
+contains_stop_usage(node::BlockNode) = node.may_stop
+contains_stop_usage(node::CodeBlockNode) = contains_stop_usage(node.body)
+# stop inside reporter blocks and task bodies doesn't propagate to the outer ask
+contains_stop_usage(::ReporterBlockNode) = false
+contains_stop_usage(::CommandTaskNode) = false
+
+ReporterBlockNode(params::Vector{String}, expr::AbstractExpr, span::SourceSpan) =
+  ReporterBlockNode(params, expr, span, !contains_nested_task_literals(expr))
+
+CommandTaskNode(params::Vector{String}, body::BlockNode, span::SourceSpan) =
+  CommandTaskNode(params, body, span, !contains_nested_task_literals(body))
 
 struct BreedSpec
   plural::String
@@ -249,13 +322,17 @@ struct OutputWidgetSpec <: InterfaceWidgetSpec
   font_size::Int
 end
 
-struct ProcedureSpec
+mutable struct ProcedureSpec
   name::String
   is_reporter::Bool
   inputs::Vector{String}
   body::BlockNode
   span::SourceSpan
+  reusable_frame::Bool
 end
+
+ProcedureSpec(name::String, is_reporter::Bool, inputs::Vector{String}, body::BlockNode, span::SourceSpan) =
+  ProcedureSpec(name, is_reporter, inputs, body, span, !contains_nested_task_literals(body))
 
 mutable struct ModelSpec
   source::String
@@ -274,6 +351,7 @@ mutable struct ModelSpec
   interface_globals::Dict{String, Any}
   view_widget::Union{Nothing, ViewWidgetSpec}
   has_interface_section::Bool
+  turtle_shapes_text::String
 end
 
 const CompiledModel = ModelSpec
@@ -295,7 +373,8 @@ function ModelSpec(source::String)
     InterfaceWidgetSpec[],
     Dict{String, Any}(),
     nothing,
-    false)
+    false,
+    "")
 end
 
 function breed_index(breeds::Vector{BreedSpec}, plural::AbstractString)
@@ -425,12 +504,25 @@ end
 
 TurtlePose(turtle::Turtle) = TurtlePose(turtle.xcor, turtle.ycor, turtle.heading)
 
-struct AgentSet
+mutable struct AgentSet
   kind::AgentKind
   members::Vector{AbstractAgent}
   breed::Union{Nothing, String}
   dynamic::Bool
+  all_live::Bool
   world::Any
+end
+
+@inline function copy_agent_members(members::Vector{AbstractAgent})
+  copy(members)
+end
+
+@inline function copy_agent_members(members::Vector{<:AbstractAgent})
+  copied = Vector{AbstractAgent}(undef, length(members))
+  for i in eachindex(members)
+    @inbounds copied[i] = members[i]
+  end
+  copied
 end
 
 AgentSet(
@@ -438,27 +530,68 @@ AgentSet(
   members::Vector{<:AbstractAgent};
   breed::Union{Nothing, String}=nothing,
   dynamic::Bool=false,
+  all_live::Bool=dynamic,
   world=nothing) =
-  AgentSet(kind, AbstractAgent[members...], breed, dynamic, world)
+  AgentSet(kind, copy_agent_members(members), breed, dynamic, all_live, world)
+
+@inline owned_agentset(
+  kind::AgentKind,
+  members::Vector{AbstractAgent};
+  breed::Union{Nothing, String}=nothing,
+  dynamic::Bool=false,
+  all_live::Bool=true,
+  world=nothing) =
+  AgentSet(kind, members, breed, dynamic, all_live, world)
 
 agent_is_live(::Observer) = true
 agent_is_live(agent::Patch) = agent.alive
 agent_is_live(agent::Turtle) = agent.alive
 agent_is_live(agent::Link) = agent.alive
 
-function Base.length(agentset::AgentSet)
-  # Fast path for dynamic patch agentsets (all patches are always alive)
+@inline function agentset_capacity(agentset::AgentSet)
   if agentset.dynamic && agentset.world isa World
     world = agentset.world::World
-    if agentset.kind == PatchKind && (agentset.breed === nothing || agentset.breed == "")
+    if agentset.kind == PatchKind
       return length(world.patches)
+    elseif agentset.kind == TurtleKind
+      isempty(world.turtle_breed_members) && !isempty(world.turtles) && rebuild_turtle_breed_members!(world)
+      breed = agentset.breed
+      if breed === nothing || breed == "TURTLES"
+        return length(get!(world.turtle_breed_members, "TURTLES") do
+          Turtle[]
+        end)
+      end
+      return length(get!(world.turtle_breed_members, breed) do
+        Turtle[]
+      end)
+    elseif agentset.kind == LinkKind
+      return length(world.links)
     end
   end
-  count(agent_is_live, current_agentset_members(agentset))
+  length(agentset.members)
 end
 
-function Base.iterate(agentset::AgentSet, state=(current_agentset_members(agentset), 1))
+function Base.length(agentset::AgentSet)
+  members = current_agentset_members(agentset)
+  agentset.all_live ? length(members) : count(agent_is_live, members)
+end
+
+function Base.iterate(agentset::AgentSet)
+  members = current_agentset_members(agentset)
+  all_live = agentset.all_live
+  _iterate_members(members, 1, all_live)
+end
+
+function Base.iterate(agentset::AgentSet, state::Tuple{Vector{T}, Int}) where T
   members, index = state
+  _iterate_members(members, index, agentset.all_live)
+end
+
+@inline function _iterate_members(members, index::Int, all_live::Bool)
+  if all_live
+    index > length(members) && return nothing
+    @inbounds return members[index], (members, index + 1)
+  end
   @inbounds while index <= length(members)
     agent = members[index]
     if agent_is_live(agent)
@@ -470,6 +603,25 @@ function Base.iterate(agentset::AgentSet, state=(current_agentset_members(agents
 end
 
 live_members(agentset::AgentSet) = AbstractAgent[agent for agent in agentset if true]
+
+# Direct member access for hot-path iteration avoiding the iterate protocol boxing
+@inline function agentset_members_for_iteration(agentset::AgentSet)
+  (current_agentset_members(agentset), agentset.all_live)
+end
+
+# Macro for zero-allocation agentset iteration in hot paths.
+# Replaces `for agent in agentset` with direct vector iteration + liveness check.
+macro for_agents(var, agentset, body)
+  quote
+    local _members, _all_live = agentset_members_for_iteration($(esc(agentset)))
+    @inbounds for _i in eachindex(_members)
+      local $(esc(var)) = _members[_i]
+      if _all_live || agent_is_live($(esc(var)))
+        $(esc(body))
+      end
+    end
+  end
+end
 
 @enum TopologyMode begin
   Torus
@@ -490,6 +642,8 @@ mutable struct World
   turtles::Vector{Turtle}
   links::Vector{Link}
   observer::Observer
+  dynamic_agentsets::Dict{Tuple{AgentKind, String}, AgentSet}
+  turtle_breed_members::Dict{String, Vector{Turtle}}
   turtle_breed_shapes::Dict{String, String}
   link_breed_shapes::Dict{String, String}
   next_turtle_id::Int
@@ -498,6 +652,8 @@ mutable struct World
   rng::MersenneTwister
   timer_start_ns::UInt64
   drawing::Union{Nothing, Matrix{NTuple{4, Float64}}}
+  patch_neighbors8::Vector{AgentSet}   # cached 8-way neighbors, indexed by patch_index
+  patch_neighbors4::Vector{AgentSet}   # cached 4-way neighbors, indexed by patch_index
 end
 
 world_width(world::World) = world.max_pxcor - world.min_pxcor + 1
@@ -559,6 +715,8 @@ function World(
     Turtle[],
     Link[],
     observer,
+    Dict{Tuple{AgentKind, String}, AgentSet}(),
+    Dict{String, Vector{Turtle}}(),
     Dict{String, String}("TURTLES" => "default"),
     Dict{String, String}("LINKS" => "default"),
     0,
@@ -566,9 +724,78 @@ function World(
     -1.0,
     MersenneTwister(seed),
     time_ns(),
-    nothing)
+    nothing,
+    AgentSet[],
+    AgentSet[])
   rebuild_patches!(world)
   world
+end
+
+function clear_turtle_breed_members!(world::World)
+  empty!(world.turtle_breed_members)
+  nothing
+end
+
+function remove_turtle_breed_member!(members::Vector{Turtle}, turtle::Turtle)
+  index = findfirst(candidate -> candidate === turtle, members)
+  index !== nothing && deleteat!(members, index)
+  members
+end
+
+function insert_turtle_breed_member!(world::World, breed::String, turtle::Turtle)
+  members = get!(world.turtle_breed_members, breed) do
+    Turtle[]
+  end
+  any(candidate -> candidate === turtle, members) && return members
+
+  insert_at = 1
+  for candidate in world.turtles
+    candidate === turtle && break
+    candidate.alive || continue
+    if breed == "TURTLES" || candidate.breed == breed
+      insert_at += 1
+    end
+  end
+  insert!(members, min(insert_at, length(members) + 1), turtle)
+  members
+end
+
+function register_turtle_breed_members!(world::World, turtle::Turtle)
+  push!(get!(world.turtle_breed_members, "TURTLES") do
+    Turtle[]
+  end, turtle)
+  turtle.breed == "TURTLES" || push!(get!(world.turtle_breed_members, turtle.breed) do
+    Turtle[]
+  end, turtle)
+  nothing
+end
+
+function unregister_turtle_breed_members!(world::World, turtle::Turtle)
+  remove_turtle_breed_member!(get!(world.turtle_breed_members, "TURTLES") do
+    Turtle[]
+  end, turtle)
+  turtle.breed == "TURTLES" || remove_turtle_breed_member!(get!(world.turtle_breed_members, turtle.breed) do
+    Turtle[]
+  end, turtle)
+  nothing
+end
+
+function move_turtle_breed_members!(world::World, turtle::Turtle, old_breed::String, new_breed::String)
+  old_breed == new_breed && return nothing
+  old_breed == "TURTLES" || remove_turtle_breed_member!(get!(world.turtle_breed_members, old_breed) do
+    Turtle[]
+  end, turtle)
+  new_breed == "TURTLES" || insert_turtle_breed_member!(world, new_breed, turtle)
+  nothing
+end
+
+function rebuild_turtle_breed_members!(world::World)
+  clear_turtle_breed_members!(world)
+  for turtle in world.turtles
+    turtle.alive || continue
+    register_turtle_breed_members!(world, turtle)
+  end
+  nothing
 end
 
 function patch_index(world::World, x::Int, y::Int)
@@ -598,29 +825,37 @@ function apply_topology(world::World, x::Float64, y::Float64)
   if world.topology == Torus
     return wrap_axis(x, world.min_pxcor, world.max_pxcor), wrap_axis(y, world.min_pycor, world.max_pycor)
   elseif world.topology == VerticalCylinder
-    if y < world.min_pycor - 0.5 || y > world.max_pycor + 0.5
+    if y < world.min_pycor - 0.5 || y >= world.max_pycor + 0.5
       throw(LogoRuntimeError("y coordinate out of bounds in non-wrapping topology"))
     end
     return wrap_axis(x, world.min_pxcor, world.max_pxcor), y
   elseif world.topology == HorizontalCylinder
-    if x < world.min_pxcor - 0.5 || x > world.max_pxcor + 0.5
+    if x < world.min_pxcor - 0.5 || x >= world.max_pxcor + 0.5
       throw(LogoRuntimeError("x coordinate out of bounds in non-wrapping topology"))
     end
     return x, wrap_axis(y, world.min_pycor, world.max_pycor)
   else
-    if x < world.min_pxcor - 0.5 || x > world.max_pxcor + 0.5 ||
-       y < world.min_pycor - 0.5 || y > world.max_pycor + 0.5
+    if x < world.min_pxcor - 0.5 || x >= world.max_pxcor + 0.5 ||
+       y < world.min_pycor - 0.5 || y >= world.max_pycor + 0.5
       throw(LogoRuntimeError("coordinates out of bounds in box topology"))
     end
     return x, y
   end
 end
 
+is_topology_bounds_error(err::LogoRuntimeError) =
+  err.message == "x coordinate out of bounds in non-wrapping topology" ||
+  err.message == "y coordinate out of bounds in non-wrapping topology" ||
+  err.message == "coordinates out of bounds in box topology"
+
 round_patch_coord(pos::Float64) = floor(Int, pos + 0.5)
+
+@inline patch_for_current_position(world::World, x::Float64, y::Float64) =
+  get_patch(world, round_patch_coord(x), round_patch_coord(y))
 
 function patch_for_position(world::World, x::Float64, y::Float64)
   wrapped_x, wrapped_y = apply_topology(world, x, y)
-  get_patch(world, round_patch_coord(wrapped_x), round_patch_coord(wrapped_y))
+  patch_for_current_position(world, wrapped_x, wrapped_y)
 end
 
 function reset_patch_memberships!(world::World)
@@ -636,7 +871,7 @@ function invalidate_patches!(world::World)
 end
 
 function register_turtle_on_patch!(world::World, turtle::Turtle)
-  patch = patch_for_position(world, turtle.xcor, turtle.ycor)
+  patch = patch_for_current_position(world, turtle.xcor, turtle.ycor)
   if turtle.id ∉ patch.turtles_here
     push!(patch.turtles_here, turtle.id)
   end
@@ -644,7 +879,7 @@ function register_turtle_on_patch!(world::World, turtle::Turtle)
 end
 
 function unregister_turtle_from_patch!(world::World, turtle::Turtle)
-  patch = patch_for_position(world, turtle.xcor, turtle.ycor)
+  patch = patch_for_current_position(world, turtle.xcor, turtle.ycor)
   th = patch.turtles_here
   tid = turtle.id
   idx = findfirst(==(tid), th)
@@ -662,7 +897,45 @@ function rebuild_patches!(world::World)
   end
   world.patches = patches
   reset_patch_memberships!(world)
+  cache_patch_neighbors!(world)
   nothing
+end
+
+"""Pre-compute and cache neighbor lists for every patch (avoids repeated allocation)."""
+function cache_patch_neighbors!(world::World)
+  n = length(world.patches)
+  resize!(world.patch_neighbors8, n)
+  resize!(world.patch_neighbors4, n)
+  for (i, patch) in enumerate(world.patches)
+    world.patch_neighbors8[i] = _compute_patch_neighbors(world, patch, false)
+    world.patch_neighbors4[i] = _compute_patch_neighbors(world, patch, true)
+  end
+  nothing
+end
+
+function _compute_patch_neighbors(world::World, patch::Patch, four_way::Bool)
+  deltas = four_way ?
+    ((1, 0), (-1, 0), (0, 1), (0, -1)) :
+    ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+  members = Vector{AbstractAgent}()
+  sizehint!(members, four_way ? 4 : 8)
+  px, py = patch.pxcor, patch.pycor
+  for (dx, dy) in deltas
+    neighbor = maybe_patch(world, px + dx, py + dy)
+    neighbor === NOBODY && continue
+    neighbor.pxcor == px && neighbor.pycor == py && continue
+    dup = false
+    @inbounds for i in eachindex(members)
+      existing = members[i]::Patch
+      if existing.pxcor == neighbor.pxcor && existing.pycor == neighbor.pycor
+        dup = true
+        break
+      end
+    end
+    dup || push!(members, neighbor)
+  end
+  sort!(members, by = p -> patch_index(world, (p::Patch).pxcor, (p::Patch).pycor))
+  owned_agentset(PatchKind, members)
 end
 
 function reset_globals!(world::World)
@@ -690,6 +963,7 @@ function clear_turtles!(world::World; reset_ids::Bool=true)
   foreach(link -> (link.alive = false), world.links)
   empty!(world.turtles)
   empty!(world.links)
+  clear_turtle_breed_members!(world)
   reset_patch_memberships!(world)
   if reset_ids
     world.next_turtle_id = 0
@@ -723,6 +997,7 @@ topology_from_wraps(wrap_x::Bool, wrap_y::Bool) =
 
 function set_topology!(world::World, wrap_x::Bool, wrap_y::Bool)
   world.topology = topology_from_wraps(wrap_x, wrap_y)
+  cache_patch_neighbors!(world)
   world
 end
 
@@ -796,6 +1071,7 @@ function create_turtle!(
   own=nothing)
   breed == "TURTLES" || has_turtle_breed(world.model, breed) ||
     throw(LogoRuntimeError("unknown turtle breed $breed"))
+  x_value, y_value = apply_topology(world, x, y)
   heading_value = heading === nothing ? Float64(rand(world.rng, 0:359)) : Float64(heading)
   color_value = color === nothing ? 5.0 + 10.0 * Float64(rand(world.rng, 0:13)) : copy_logo_slot_value(color)
   shape_value = shape === nothing ? default_turtle_shape(world, breed) : String(shape)
@@ -806,8 +1082,8 @@ function create_turtle!(
   world.next_turtle_id += 1
   turtle = Turtle(
     world.next_turtle_id - 1,
-    x,
-    y,
+    x_value,
+    y_value,
     heading_value,
     color_value,
     shape_value,
@@ -821,6 +1097,7 @@ function create_turtle!(
     own_values,
     true)
   push!(world.turtles, turtle)
+  register_turtle_breed_members!(world, turtle)
   register_turtle_on_patch!(world, turtle)
   turtle
 end
@@ -855,6 +1132,7 @@ function set_turtle_breed!(world::World, turtle::Turtle, breed::AbstractString)
   end
   turtle.breed = canonical
   turtle.own = new_own
+  move_turtle_breed_members!(world, turtle, old_breed, canonical)
   canonical != old_breed && (turtle.shape = default_turtle_shape(world, canonical))
   turtle
 end
@@ -911,6 +1189,7 @@ end
 function kill_turtle!(world::World, turtle::Turtle)
   turtle.alive || return turtle
   unregister_turtle_from_patch!(world, turtle)
+  unregister_turtle_breed_members!(world, turtle)
   turtle.alive = false
   for link in world.links
     link.alive && (link.end1 == turtle.id || link.end2 == turtle.id) && kill_link!(world, link)
@@ -963,6 +1242,23 @@ function tied_targets(world::World, turtle_id::Int)
   targets
 end
 
+function tied_component_ids(world::World, turtle_id::Int)
+  ids = Int[turtle_id]
+  seen = Set{Int}([turtle_id])
+  index = 1
+  while index <= length(ids)
+    current_id = ids[index]
+    index += 1
+    for (_, target_id) in tied_targets(world, current_id)
+      if !(target_id in seen)
+        push!(seen, target_id)
+        push!(ids, target_id)
+      end
+    end
+  end
+  ids
+end
+
 function plan_tied_turtle_pose!(
   world::World,
   turtle_id::Int,
@@ -994,22 +1290,16 @@ function plan_tied_turtle_pose!(
 end
 
 function set_turtle_pose!(world::World, turtle::Turtle, x::Float64, y::Float64, heading::Real)
-  # Fast path: if no links exist or no tied links, skip tie propagation entirely
-  has_ties = false
-  for link in world.links
-    if link.alive && link.tie_mode != "none"
-      has_ties = true
-      break
-    end
-  end
-  if !has_ties
+  targets = tied_targets(world, turtle.id)
+  if isempty(targets)
     set_turtle_pose_raw!(world, turtle, x, y, heading)
     return turtle
   end
 
   snapshot = Dict{Int, TurtlePose}()
-  for candidate in world.turtles
-    candidate.alive || continue
+  for turtle_id in tied_component_ids(world, turtle.id)
+    candidate = maybe_turtle_by_id(world, turtle_id)
+    candidate === nothing && continue
     snapshot[candidate.id] = TurtlePose(candidate)
   end
   planned = Dict{Int, TurtlePose}()
@@ -1109,19 +1399,29 @@ function current_agentset_members(agentset::AgentSet)
 
   world = agentset.world::World
   if agentset.kind == TurtleKind
+    isempty(world.turtle_breed_members) && !isempty(world.turtles) && rebuild_turtle_breed_members!(world)
     breed = agentset.breed
     if breed === nothing || breed == "TURTLES"
-      return AbstractAgent[t for t in world.turtles if t.alive]
+      return get!(world.turtle_breed_members, "TURTLES") do
+        Turtle[]
+      end
     end
-    canonical_breed = canonical_name(breed)
-    return AbstractAgent[t for t in world.turtles if t.alive && t.breed == canonical_breed]
+    return get!(world.turtle_breed_members, breed) do
+      Turtle[]
+    end
   elseif agentset.kind == LinkKind
     breed = agentset.breed
+    members = sizehint!(Link[], length(world.links))
     if breed === nothing || breed == "LINKS"
-      return AbstractAgent[l for l in world.links if l.alive]
+      for link in world.links
+        link.alive && push!(members, link)
+      end
+      return members
     end
-    canonical_breed = canonical_name(breed)
-    return AbstractAgent[l for l in world.links if l.alive && l.breed == canonical_breed]
+    for link in world.links
+      link.alive && link.breed == breed && push!(members, link)
+    end
+    return members
   end
 
   # Patches are always all alive — return backing array directly to avoid allocation
@@ -1129,11 +1429,15 @@ function current_agentset_members(agentset::AgentSet)
 end
 
 function all_turtles(world::World)
-  AgentSet(TurtleKind, AbstractAgent[]; breed="TURTLES", dynamic=true, world=world)
+  get!(world.dynamic_agentsets, (TurtleKind, "TURTLES")) do
+    AgentSet(TurtleKind, AbstractAgent[]; breed="TURTLES", dynamic=true, world=world)
+  end
 end
 
 function all_patches(world::World)
-  AgentSet(PatchKind, AbstractAgent[]; dynamic=true, world=world)
+  get!(world.dynamic_agentsets, (PatchKind, "")) do
+    AgentSet(PatchKind, AbstractAgent[]; dynamic=true, world=world)
+  end
 end
 
 function living_links(world::World)
@@ -1141,21 +1445,27 @@ function living_links(world::World)
 end
 
 function all_links(world::World)
-  AgentSet(LinkKind, AbstractAgent[]; breed="LINKS", dynamic=true, world=world)
+  get!(world.dynamic_agentsets, (LinkKind, "LINKS")) do
+    AgentSet(LinkKind, AbstractAgent[]; breed="LINKS", dynamic=true, world=world)
+  end
 end
 
 function breed_agentset(world::World, breed::AbstractString)
   canonical = canonical_name(breed)
   canonical == "TURTLES" && return all_turtles(world)
   has_turtle_breed(world.model, canonical) || throw(LogoRuntimeError("unknown turtle breed $breed"))
-  AgentSet(TurtleKind, AbstractAgent[]; breed=canonical, dynamic=true, world=world)
+  get!(world.dynamic_agentsets, (TurtleKind, canonical)) do
+    AgentSet(TurtleKind, AbstractAgent[]; breed=canonical, dynamic=true, world=world)
+  end
 end
 
 function link_breed_agentset(world::World, breed::AbstractString)
   canonical = canonical_name(breed)
   canonical == "LINKS" && return all_links(world)
   has_link_breed(world.model, canonical) || throw(LogoRuntimeError("unknown link breed $breed"))
-  AgentSet(LinkKind, AbstractAgent[]; breed=canonical, dynamic=true, world=world)
+  get!(world.dynamic_agentsets, (LinkKind, canonical)) do
+    AgentSet(LinkKind, AbstractAgent[]; breed=canonical, dynamic=true, world=world)
+  end
 end
 
 function maybe_patch(world::World, x::Real, y::Real)
@@ -1170,16 +1480,30 @@ function maybe_patch(world::World, x::Real, y::Real)
   end
 end
 
-function turtles_on_patch(world::World, patch::Patch; breed::Union{Nothing, AbstractString}=nothing)
-  canonical_breed = breed === nothing ? "TURTLES" : canonical_name(breed)
-  breed === nothing || has_turtle_breed(world.model, canonical_breed) || throw(LogoRuntimeError("unknown turtle breed $breed"))
-  members = sizehint!(Turtle[], length(patch.turtles_here))
+function turtles_on_patch_canonical(world::World, patch::Patch, canonical_breed::AbstractString)
+  canonical_breed == "TURTLES" && return turtles_on_patch(world, patch)
+  has_turtle_breed(world.model, canonical_breed) || throw(LogoRuntimeError("unknown turtle breed $canonical_breed"))
+  members = sizehint!(AbstractAgent[], length(patch.turtles_here))
   for id in patch.turtles_here
     turtle = maybe_turtle_by_id(world, id)
     turtle === nothing && continue
-    (breed === nothing || turtle.breed == canonical_breed) && push!(members, turtle)
+    turtle.breed == canonical_breed && push!(members, turtle)
   end
-  AgentSet(TurtleKind, members; breed=canonical_breed)
+  owned_agentset(TurtleKind, members; breed=canonical_breed)
+end
+
+function turtles_on_patch(world::World, patch::Patch)
+  members = sizehint!(AbstractAgent[], length(patch.turtles_here))
+  for id in patch.turtles_here
+    turtle = maybe_turtle_by_id(world, id)
+    turtle === nothing && continue
+    push!(members, turtle)
+  end
+  owned_agentset(TurtleKind, members; breed="TURTLES")
+end
+
+function turtles_on_patch(world::World, patch::Patch, breed::AbstractString)
+  turtles_on_patch_canonical(world, patch, canonical_name(breed))
 end
 
 function patch_variable_value(patch::Patch, name::AbstractString)
@@ -1217,31 +1541,9 @@ function set_patch_variable!(patch::Patch, name::AbstractString, value)
 end
 
 function patch_neighbors(world::World, patch::Patch; four_way::Bool=false)
-  deltas = four_way ?
-    ((1, 0), (-1, 0), (0, 1), (0, -1)) :
-    ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
-  # Pre-allocate with max capacity; avoid Dict for common case
-  max_n = four_way ? 4 : 8
-  members = Vector{AbstractAgent}()
-  sizehint!(members, max_n)
-  px, py = patch.pxcor, patch.pycor
-  for (dx, dy) in deltas
-    neighbor = maybe_patch(world, px + dx, py + dy)
-    neighbor === NOBODY && continue
-    neighbor.pxcor == px && neighbor.pycor == py && continue
-    # Check for duplicates (only possible at edges with wrapping)
-    dup = false
-    @inbounds for i in eachindex(members)
-      existing = members[i]::Patch
-      if existing.pxcor == neighbor.pxcor && existing.pycor == neighbor.pycor
-        dup = true
-        break
-      end
-    end
-    dup || push!(members, neighbor)
-  end
-  sort!(members, by = p -> patch_index(world, (p::Patch).pxcor, (p::Patch).pycor))
-  AgentSet(PatchKind, members)
+  idx = patch_index(world, patch.pxcor, patch.pycor)
+  cache = four_way ? world.patch_neighbors4 : world.patch_neighbors8
+  @inbounds cache[idx]
 end
 
 function _read_patch_own(patch::Patch, canonical::String)
@@ -1330,7 +1632,7 @@ end
 
 function my_links(world::World, turtle::Turtle; breed::Union{Nothing, String}=nothing, mode::Symbol=:all)
   canonical_breed = breed === nothing ? nothing : canonical_name(breed)
-  members = Link[]
+  members = sizehint!(AbstractAgent[], length(world.links))
   for link in living_links(world)
     canonical_breed !== nothing && link.breed != canonical_breed && continue
     touches = link.end1 == turtle.id || link.end2 == turtle.id
@@ -1342,7 +1644,7 @@ function my_links(world::World, turtle::Turtle; breed::Union{Nothing, String}=no
       ((link.directed && link.end1 == turtle.id) || (!link.directed && touches)) && push!(members, link)
     end
   end
-  AgentSet(LinkKind, members; breed=canonical_breed)
+  owned_agentset(LinkKind, members; breed=canonical_breed)
 end
 
 function link_neighbors(world::World, turtle::Turtle; breed::Union{Nothing, String}=nothing, mode::Symbol=:all)
@@ -1357,6 +1659,9 @@ function link_neighbors(world::World, turtle::Turtle; breed::Union{Nothing, Stri
       push!(ids, link.end1 == turtle.id ? link.end2 : link.end1)
     end
   end
-  members = [turtle_by_id(world, id) for id in sort(collect(ids))]
-  AgentSet(TurtleKind, members; breed="TURTLES")
+  members = sizehint!(AbstractAgent[], length(ids))
+  for id in sort!(collect(ids))
+    push!(members, turtle_by_id(world, id))
+  end
+  owned_agentset(TurtleKind, members; breed="TURTLES")
 end

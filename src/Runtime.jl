@@ -93,6 +93,12 @@ mutable struct RuntimeState
   plot_manager::PlotManagerState
   plot_rng::MersenneTwister
   custom_turtle_shapes::Dict{String, Any}
+  prepared_arg_buffers::Vector{Vector{Any}}
+  prepared_arg_depth::Base.RefValue{Int}
+  agent_iteration_buffers::Vector{Vector{AbstractAgent}}
+  agent_iteration_depth::Base.RefValue{Int}
+  scope_stack_buffers::Vector{Vector{Dict{String, Any}}}
+  scope_stack_depth::Base.RefValue{Int}
 end
 
 struct WorldPersistenceSnapshot
@@ -129,6 +135,9 @@ Context(
 
 # Dict pool for scope frames — avoids repeated allocation/GC of empty Dicts
 const _SCOPE_DICT_POOL = Dict{String, Any}[]
+const _EVERY_STATE_POOL = Dict{Tuple{Int, Any}, UInt64}[]
+const EMPTY_SCOPE_STACK = Dict{String, Any}[]
+const EMPTY_EVERY_STATE = Dict{Tuple{Int, Any}, UInt64}()
 
 function _get_scope_dict()
   if !isempty(_SCOPE_DICT_POOL)
@@ -145,13 +154,63 @@ function _return_scope_dict!(d::Dict{String, Any})
   nothing
 end
 
+function _get_every_state_dict()
+  if !isempty(_EVERY_STATE_POOL)
+    return pop!(_EVERY_STATE_POOL)
+  end
+  return Dict{Tuple{Int, Any}, UInt64}()
+end
+
+function _return_every_state_dict!(d::Dict{Tuple{Int, Any}, UInt64})
+  empty!(d)
+  if length(_EVERY_STATE_POOL) < 64
+    push!(_EVERY_STATE_POOL, d)
+  end
+  nothing
+end
+
+@inline function maybe_acquire_every_state!(
+  context::Context,
+  uses_every::Bool)
+  if uses_every
+    child_every_state = _get_every_state_dict()
+    context.every_state = child_every_state
+    return child_every_state
+  end
+  return nothing
+end
+
+@inline function restore_every_state!(
+  context::Context,
+  saved_every_state::Dict{Tuple{Int, Any}, UInt64},
+  child_every_state::Union{Nothing, Dict{Tuple{Int, Any}, UInt64}})
+  context.every_state = saved_every_state
+  child_every_state === nothing || _return_every_state_dict!(child_every_state)
+  nothing
+end
+
+@inline function copy_scope_stack(scopes::Vector{Dict{String, Any}})
+  copied = Vector{Dict{String, Any}}(undef, length(scopes))
+  !isempty(scopes) && copyto!(copied, 1, scopes, 1, length(scopes))
+  copied
+end
+
+@inline function extend_scope_stack(scopes::Vector{Dict{String, Any}}, frame::Dict{String, Any})
+  count = length(scopes)
+  extended = Vector{Dict{String, Any}}(undef, count + 1)
+  count > 0 && copyto!(extended, 1, scopes, 1, count)
+  extended[count + 1] = frame
+  extended
+end
+
 abstract type AbstractReporterTaskValue end
 abstract type AbstractCommandTaskValue end
 
 struct ReporterTaskValue <: AbstractReporterTaskValue
   block::ReporterBlockNode
   locals::Vector{Dict{String, Any}}
-  source::String
+  model_source::String
+  source_span::SourceSpan
   string_scope_depth::Int
 end
 
@@ -166,7 +225,8 @@ end
 struct CommandTaskValue <: AbstractCommandTaskValue
   task::CommandTaskNode
   locals::Vector{Dict{String, Any}}
-  source::String
+  model_source::String
+  source_span::SourceSpan
   string_scope_depth::Int
 end
 
@@ -277,7 +337,7 @@ function create_runtime(
   patch_size::Union{Nothing, Real}=nothing,
   seed::Integer=1)
   world = World(model; min_pxcor=min_pxcor, max_pxcor=max_pxcor, min_pycor=min_pycor, max_pycor=max_pycor, topology=topology, patch_size=patch_size, seed=seed)
-  RuntimeState(
+  rt = RuntimeState(
     model,
     world,
     registry,
@@ -289,7 +349,17 @@ function create_runtime(
     "",
     plot_manager_from_model(model),
     copy(world.rng),
-    Dict{String, Any}())
+    Dict{String, Any}(),
+    Vector{Vector{Any}}(),
+    Ref(0),
+    Vector{Vector{AbstractAgent}}(),
+    Ref(0),
+    Vector{Vector{Dict{String, Any}}}(),
+    Ref(0))
+  if !isempty(model.turtle_shapes_text)
+    load_turtle_shapes!(rt, model.turtle_shapes_text)
+  end
+  rt
 end
 
 function load_turtle_shapes!(runtime::RuntimeState, text::AbstractString)
@@ -825,8 +895,8 @@ logical(value) = throw(LogoRuntimeError("expected a boolean, got $(typeof(value)
 logo_string(value::AbstractString) = String(value)
 logo_string(value::Bool) = lowercase(string(value))
 logo_string(::NobodyValue) = "nobody"
-logo_string(value::CommandTaskValue) = "(anonymous command: $(value.source))"
-logo_string(value::ReporterTaskValue) = "(anonymous reporter: $(value.source))"
+logo_string(value::CommandTaskValue) = "(anonymous command: $(source_fragment(value.model_source, value.source_span)))"
+logo_string(value::ReporterTaskValue) = "(anonymous reporter: $(source_fragment(value.model_source, value.source_span)))"
 logo_string(value::Turtle) = value.alive ? "(turtle $(value.id))" : "nobody"
 logo_string(value::Patch) = value.alive ? "(patch $(value.pxcor) $(value.pycor))" : "nobody"
 logo_string(value::Link) = value.alive ? "(link $(value.end1) $(value.end2))" : "nobody"
@@ -1378,7 +1448,7 @@ function run_plot_callback_code!(context::Context, source::AbstractString)
   child = Context(context.runtime, context.runtime.world.observer, [Dict{String, Any}()], nothing, false, 0)
   with_plot_randomness!(child) do
     try
-      execute_block!(child, block; push_scope=false)
+      execute_block!(child, block, false)
       false
     catch signal
       if signal isa StopSignal
@@ -2002,6 +2072,7 @@ function import_world!(runtime::RuntimeState, path::AbstractString)
   snapshot isa WorldPersistenceSnapshot || throw(LogoRuntimeError("The file $(resolved) is not a world export"))
   runtime.world = snapshot.world
   runtime.world.model = runtime.model
+  rebuild_turtle_breed_members!(runtime.world)
   runtime.perspective_subject = snapshot.perspective_subject
   runtime.output_area = snapshot.output_area
   if snapshot.plot_manager !== nothing
@@ -2935,6 +3006,15 @@ function draw_turtle_pen_motion!(world::World, turtle::Turtle, start_x::Real, st
 end
 
 function apply_turtle_pen_motion!(world::World, old_positions::Dict{Int, NTuple{2, Float64}})
+  isempty(old_positions) && return nothing
+  if length(old_positions) == 1
+    for (turtle_id, (old_x, old_y)) in old_positions
+      turtle = maybe_turtle_by_id(world, turtle_id)
+      turtle === nothing && continue
+      draw_turtle_pen_motion!(world, turtle, old_x, old_y)
+    end
+    return nothing
+  end
   for turtle_id in sort!(collect(keys(old_positions)))
     turtle = maybe_turtle_by_id(world, turtle_id)
     turtle === nothing && continue
@@ -2946,9 +3026,23 @@ end
 
 function set_turtle_pose_with_pen!(world::World, turtle::Turtle, x::Float64, y::Float64, heading::Real)
   ensure_live_agent(world, turtle)
+  tied_ids = tied_component_ids(world, turtle.id)
+  if length(tied_ids) == 1
+    if pen_draw_mode(turtle) == :none
+      set_turtle_pose!(world, turtle, x, y, heading)
+    else
+      old_x, old_y = turtle.xcor, turtle.ycor
+      set_turtle_pose!(world, turtle, x, y, heading)
+      draw_turtle_pen_motion!(world, turtle, old_x, old_y)
+    end
+    return turtle
+  end
+
   old_positions = Dict{Int, NTuple{2, Float64}}()
-  for candidate in world.turtles
-    candidate.alive || continue
+  for turtle_id in tied_ids
+    candidate = maybe_turtle_by_id(world, turtle_id)
+    candidate === nothing && continue
+    pen_draw_mode(candidate) == :none && continue
     old_positions[candidate.id] = (candidate.xcor, candidate.ycor)
   end
   set_turtle_pose!(world, turtle, x, y, heading)
@@ -2965,6 +3059,22 @@ function jump_turtle_with_pen!(world::World, turtle::Turtle, distance::Real)
   new_x = turtle.xcor + Float64(distance) * sin(heading_radians)
   new_y = turtle.ycor + Float64(distance) * cos(heading_radians)
   move_turtle_to_with_pen!(world, turtle, new_x, new_y)
+end
+
+function move_turtle_with_pen_blocking!(world::World, turtle::Turtle, distance::Real)
+  ensure_live_agent(world, turtle)
+  remaining = Float64(distance)
+  while abs(remaining) > 1e-12
+    step = abs(remaining) <= 1.0 ? remaining : sign(remaining)
+    try
+      jump_turtle_with_pen!(world, turtle, step)
+    catch err
+      err isa LogoRuntimeError && is_topology_bounds_error(err) && return turtle
+      rethrow()
+    end
+    remaining -= step
+  end
+  turtle
 end
 
 function stamp_agent!(world::World, turtle::Turtle; erase::Bool=false, custom_shapes::Dict{String, Any}=Dict{String, Any}())
@@ -3070,12 +3180,16 @@ end
 
 function current_patch(world::World, agent::Turtle)
   ensure_live_agent(world, agent)
-  patch_for_position(world, agent.xcor, agent.ycor)
+  get_patch(world, round_patch_coord(agent.xcor), round_patch_coord(agent.ycor))
 end
 
 current_patch(world::World, agent::Patch) = ensure_live_agent(world, agent)
 
 function current_scope(context::Context)
+  if isempty(context.locals)
+    push!(context.locals, Dict{String, Any}())
+    context.string_scope_depth = max(context.string_scope_depth, 1)
+  end
   context.locals[end]
 end
 
@@ -3115,9 +3229,13 @@ function primitive_input_bounds(syntax::PrimitiveSyntax)
   min_inputs, max_inputs
 end
 
-function task_scope(params::Vector{String}, actuals::Vector{Any})
+function task_scope(params::Vector{String}, actuals::Vector{Any}, reusable::Bool=false)
   length(actuals) >= length(params) || throw(task_arity_error("anonymous procedure", length(params), length(actuals)))
-  Dict{String, Any}(params[i] => actuals[i] for i in eachindex(params))
+  frame = reusable ? _get_scope_dict() : Dict{String, Any}()
+  for i in eachindex(params)
+    frame[params[i]] = actuals[i]
+  end
+  frame
 end
 
 block_caller(context::Context) = context.agent isa Observer ? context.caller : context.agent
@@ -3436,6 +3554,17 @@ function resolve_variable(context::Context, name::String)
   get_agent_variable(context.agent, context.runtime.world, name)
 end
 
+function resolve_nonlocal_variable(context::Context, name::String)
+  if haskey(context.runtime.world.observer.globals, name)
+    return context.runtime.world.observer.globals[name]
+  elseif has_turtle_breed(context.runtime.model, name)
+    return breed_agentset(context.runtime.world, name)
+  elseif has_link_breed(context.runtime.model, name)
+    return link_breed_agentset(context.runtime.world, name)
+  end
+  get_agent_variable(context.agent, context.runtime.world, name)
+end
+
 function assign_variable!(context::Context, name::String, value)
   scope = find_local_scope(context, name)
   if scope !== nothing
@@ -3469,7 +3598,7 @@ function eval_expr(context::Context, expr::ListLiteral)
 end
 
 function eval_expr(context::Context, expr::VariableRef)
-  resolve_variable(context, expr.name)
+  expr.search_locals ? resolve_variable(context, expr.name) : resolve_nonlocal_variable(context, expr.name)
 end
 
 function eval_expr(context::Context, expr::UnaryExpr)
@@ -3478,14 +3607,17 @@ function eval_expr(context::Context, expr::UnaryExpr)
 end
 
 eval_expr(context::Context, expr::ReporterBlockNode) =
-  ReporterTaskValue(expr, copy(context.locals), source_fragment(context.runtime.model.source, expr.span), context.string_scope_depth)
+  ReporterTaskValue(expr, copy_scope_stack(context.locals), context.runtime.model.source, expr.span, context.string_scope_depth)
 eval_expr(context::Context, expr::CommandTaskNode) =
-  CommandTaskValue(expr, copy(context.locals), source_fragment(context.runtime.model.source, expr.span), context.string_scope_depth)
+  CommandTaskValue(expr, copy_scope_stack(context.locals), context.runtime.model.source, expr.span, context.string_scope_depth)
 eval_expr(context::Context, expr::CallableRefNode) = resolve_callable(context, expr.name)
 
 function select_task_actuals(actuals::Vector{Any}, minimum_inputs::Int, maximum_inputs::Union{Nothing, Int}, kind::AbstractString)
   length(actuals) >= minimum_inputs || throw(task_arity_error(kind, minimum_inputs, length(actuals)))
-  maximum_inputs === nothing ? copy(actuals) : Any[actuals[1:min(length(actuals), maximum_inputs)]...]
+  if maximum_inputs === nothing || length(actuals) <= maximum_inputs
+    return actuals
+  end
+  Any[actuals[1:maximum_inputs]...]
 end
 
 function invoke_reporter_task(
@@ -3494,11 +3626,30 @@ function invoke_reporter_task(
   actuals::Vector{Any};
   agent::AbstractAgent=context.agent,
   caller::Union{Nothing, AbstractAgent}=context.agent)
-  frame = task_scope(task.block.params, actuals)
-  child_locals = copy(task.locals)
-  push!(child_locals, frame)
-  child = Context(context.runtime, agent, child_locals, caller, context.in_ask, task.string_scope_depth)
-  eval_expr(child, task.block.expr)
+  reusable_frame = task.block.reusable_frame
+  frame = task_scope(task.block.params, actuals, reusable_frame)
+  child_locals = acquire_scope_stack_buffer!(context.runtime, task.locals, frame)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = task.string_scope_depth
+  try
+    return eval_expr(context, task.block.expr)
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    release_scope_stack_buffer!(context.runtime)
+    reusable_frame && _return_scope_dict!(frame)
+  end
 end
 
 function invoke_reporter_task(
@@ -3511,8 +3662,27 @@ function invoke_reporter_task(
   agent_allowed(spec.syntax.agent_classes, agent_kind(agent)) ||
     throw(LogoRuntimeError("$(spec.name) is not allowed for the current agent"))
   minimum_inputs, maximum_inputs = primitive_input_bounds(spec.syntax)
-  child = Context(context.runtime, agent, copy(context.locals), caller, context.in_ask, context.string_scope_depth)
-  spec.evaluator(child, select_task_actuals(actuals, minimum_inputs, maximum_inputs, "reporter task"))
+  child_locals = acquire_scope_stack_buffer!(context.runtime, context.locals)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = saved_scope_depth
+  try
+    return spec.evaluator(context, select_task_actuals(actuals, minimum_inputs, maximum_inputs, "reporter task"))
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    release_scope_stack_buffer!(context.runtime)
+  end
 end
 
 function invoke_reporter_task(
@@ -3522,11 +3692,29 @@ function invoke_reporter_task(
   agent::AbstractAgent=context.agent,
   caller::Union{Nothing, AbstractAgent}=context.agent)
   procedure = task.procedure
+  direct_expr = simple_report_expr(procedure)
+  direct_stmts = direct_expr === nothing ? noscope_statements(procedure.body) : nothing
   selected = select_task_actuals(actuals, length(procedure.inputs), length(procedure.inputs), "reporter task")
-  frame = Dict{String, Any}(procedure.inputs[i] => selected[i] for i in eachindex(procedure.inputs))
-  child = Context(context.runtime, agent, [frame], caller, context.in_ask, 1)
+  frame = task_scope(procedure.inputs, selected)
+  child_locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK, frame)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  saved_every_state = context.every_state
+  child_every_state = maybe_acquire_every_state!(context, procedure.body.uses_every)
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = 1
   try
-    execute_block!(child, procedure.body; push_scope=false)
+    if direct_expr === nothing
+      execute_block_fast!(context, procedure.body, nothing, direct_stmts, false)
+    else
+      return eval_expr(context, direct_expr)
+    end
   catch signal
     if signal isa ReportSignal
       return signal.value
@@ -3534,6 +3722,14 @@ function invoke_reporter_task(
       throw(stop_inside_reporter_error())
     end
     rethrow()
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    restore_every_state!(context, saved_every_state, child_every_state)
+    release_scope_stack_buffer!(context.runtime)
   end
   throw(LogoRuntimeError("reporter $(procedure.name) did not report a value"))
 end
@@ -3545,12 +3741,36 @@ function invoke_command_task(
   agent::AbstractAgent=context.agent,
   caller::Union{Nothing, AbstractAgent}=context.agent)
   length(actuals) >= length(task.task.params) || throw(task_arity_error("anonymous procedure", length(task.task.params), length(actuals)))
-  frame = Dict{String, Any}(task.task.params[i] => actuals[i] for i in eachindex(task.task.params))
-  child_locals = copy(task.locals)
-  push!(child_locals, frame)
-  child = Context(context.runtime, agent, child_locals, caller, context.in_ask, task.string_scope_depth)
-  execute_block!(child, task.task.body; push_scope=false)
-  nothing
+  reusable_frame = task.task.reusable_frame
+  direct_stmt = single_noscope_stmt(task.task.body)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(task.task.body) : nothing
+  frame = task_scope(task.task.params, actuals, reusable_frame)
+  child_locals = acquire_scope_stack_buffer!(context.runtime, task.locals, frame)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  saved_every_state = context.every_state
+  child_every_state = maybe_acquire_every_state!(context, task.task.body.uses_every)
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = task.string_scope_depth
+  try
+    execute_block_fast!(context, task.task.body, direct_stmt, direct_stmts, false)
+    nothing
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    restore_every_state!(context, saved_every_state, child_every_state)
+    release_scope_stack_buffer!(context.runtime)
+    reusable_frame && _return_scope_dict!(frame)
+  end
 end
 
 function invoke_command_task(
@@ -3563,9 +3783,28 @@ function invoke_command_task(
   agent_allowed(spec.syntax.agent_classes, agent_kind(agent)) ||
     throw(LogoRuntimeError("$(spec.name) is not allowed for the current agent"))
   minimum_inputs, maximum_inputs = primitive_task_input_bounds(spec)
-  child = Context(context.runtime, agent, copy(context.locals), caller, context.in_ask, context.string_scope_depth)
-  spec.evaluator(child, select_task_actuals(actuals, minimum_inputs, maximum_inputs, "command task"))
-  nothing
+  child_locals = acquire_scope_stack_buffer!(context.runtime, context.locals)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = saved_scope_depth
+  try
+    spec.evaluator(context, select_task_actuals(actuals, minimum_inputs, maximum_inputs, "command task"))
+    nothing
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    release_scope_stack_buffer!(context.runtime)
+  end
 end
 
 function invoke_command_task(
@@ -3575,11 +3814,25 @@ function invoke_command_task(
   agent::AbstractAgent=context.agent,
   caller::Union{Nothing, AbstractAgent}=context.agent)
   procedure = task.procedure
+  direct_stmt = single_noscope_stmt(procedure.body)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(procedure.body) : nothing
   selected = select_task_actuals(actuals, length(procedure.inputs), length(procedure.inputs), "command task")
-  frame = Dict{String, Any}(procedure.inputs[i] => selected[i] for i in eachindex(procedure.inputs))
-  child = Context(context.runtime, agent, [frame], caller, context.in_ask, 1)
+  frame = task_scope(procedure.inputs, selected)
+  child_locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK, frame)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  saved_every_state = context.every_state
+  child_every_state = maybe_acquire_every_state!(context, procedure.body.uses_every)
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = 1
   try
-    execute_block!(child, procedure.body; push_scope=false)
+    execute_block_fast!(context, procedure.body, direct_stmt, direct_stmts, false)
   catch signal
     if signal isa StopSignal
       return nothing
@@ -3587,13 +3840,21 @@ function invoke_command_task(
       throw(report_outside_reporter_error())
     end
     rethrow()
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    restore_every_state!(context, saved_every_state, child_every_state)
+    release_scope_stack_buffer!(context.runtime)
   end
   nothing
 end
 
 function eval_reporter_task_arg(context::Context, arg, opname::AbstractString=""; allow_string::Bool=false)
   if arg isa ReporterBlockNode
-    return ReporterTaskValue(arg, copy(context.locals), source_fragment(context.runtime.model.source, arg.span), context.string_scope_depth)
+    return ReporterTaskValue(arg, copy_scope_stack(context.locals), context.runtime.model.source, arg.span, context.string_scope_depth)
   elseif arg isa CallableRefNode
     value = resolve_callable(context, arg.name)
     if allow_string && value isa Union{PrimitiveReporterTaskValue, ProcedureReporterTaskValue} && exact_zero_input_reporter(value)
@@ -3606,7 +3867,7 @@ end
 
 function eval_command_task_arg(context::Context, arg, opname::AbstractString=""; allow_string::Bool=false)
   if arg isa CommandTaskNode
-    return CommandTaskValue(arg, copy(context.locals), source_fragment(context.runtime.model.source, arg.span), context.string_scope_depth)
+    return CommandTaskValue(arg, copy_scope_stack(context.locals), context.runtime.model.source, arg.span, context.string_scope_depth)
   elseif arg isa CallableRefNode
     value = resolve_callable(context, arg.name)
     if allow_string && value isa Union{PrimitiveReporterTaskValue, ProcedureReporterTaskValue} && exact_zero_input_reporter(value)
@@ -3617,12 +3878,14 @@ function eval_command_task_arg(context::Context, arg, opname::AbstractString="";
   coerce_command_task(eval_expr(context, arg), opname; allow_string=allow_string)
 end
 
+const EMPTY_ACTUALS = Any[]
+
 function eval_reporter_block(
   context::Context,
-  block::ReporterBlockNode;
-  agent::AbstractAgent=context.agent,
-  caller::Union{Nothing, AbstractAgent}=context.agent,
-  actuals::Vector{Any}=Any[])
+  block::ReporterBlockNode,
+  agent::AbstractAgent,
+  caller::Union{Nothing, AbstractAgent},
+  actuals::Vector{Any}=EMPTY_ACTUALS)
   if isempty(block.params) && isempty(actuals)
     # Fast path: no params, no actuals — just switch agent context without copying locals
     if agent === context.agent && caller === context.caller
@@ -3639,29 +3902,47 @@ function eval_reporter_block(
       context.caller = saved_caller
     end
   end
-  frame = task_scope(block.params, actuals)
-  child_locals = copy(context.locals)
-  push!(child_locals, frame)
-  child = Context(context.runtime, agent, child_locals, caller, context.in_ask, context.string_scope_depth)
-  eval_expr(child, block.expr)
+  reusable_frame = block.reusable_frame
+  frame = task_scope(block.params, actuals, reusable_frame)
+  child_locals = acquire_scope_stack_buffer!(context.runtime, context.locals, frame)
+  saved_agent = context.agent
+  saved_locals = context.locals
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  saved_scope_depth = context.string_scope_depth
+  context.agent = agent
+  context.locals = child_locals
+  context.caller = caller
+  context.in_ask = saved_in_ask
+  context.string_scope_depth = saved_scope_depth
+  try
+    return eval_expr(context, block.expr)
+  finally
+    context.agent = saved_agent
+    context.locals = saved_locals
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+    context.string_scope_depth = saved_scope_depth
+    release_scope_stack_buffer!(context.runtime)
+    reusable_frame && _return_scope_dict!(frame)
+  end
 end
 
-function primitive_modes(spec::PrimitiveSpec)
-  modes = Symbol[]
-  if spec.syntax.left != VoidType
-    push!(modes, effective_arg_mode(spec.syntax.left, :eval))
-  end
-  for (index, mask) in enumerate(spec.syntax.right)
-    fallback = index <= length(spec.syntax.arg_modes) ? spec.syntax.arg_modes[index] : :eval
-    push!(modes, effective_arg_mode(mask, fallback))
-  end
-  modes
+function eval_reporter_block(
+  context::Context,
+  block::ReporterBlockNode;
+  agent::AbstractAgent=context.agent,
+  caller::Union{Nothing, AbstractAgent}=context.agent,
+  actuals::Vector{Any}=EMPTY_ACTUALS)
+  eval_reporter_block(context, block, agent, caller, actuals)
 end
+
+primitive_modes(spec::PrimitiveSpec) = spec.modes
 
 function primitive_task_input_bounds(spec::PrimitiveSpec)
   min_inputs = spec.syntax.left == VoidType ? 0 : 1
   max_inputs = spec.syntax.left == VoidType ? 0 : 1
-  modes = primitive_modes(spec)
+  modes = spec.modes
   offset = spec.syntax.left == VoidType ? 0 : 1
 
   for (index, mask) in enumerate(spec.syntax.right)
@@ -3707,46 +3988,99 @@ function execute_every!(context::Context, stmt::CommandCall)
   nothing
 end
 
-const _MODES_CACHE = Dict{UInt, Vector{Symbol}}()
-
-function cached_primitive_modes(spec::PrimitiveSpec)
-  key = objectid(spec)
-  get!(_MODES_CACHE, key) do
-    primitive_modes(spec)
+@inline function acquire_prepared_args!(runtime::RuntimeState, nargs::Int)
+  depth_ref = runtime.prepared_arg_depth
+  depth_ref[] += 1
+  depth = depth_ref[]
+  buffers = runtime.prepared_arg_buffers
+  if depth > length(buffers)
+    push!(buffers, Any[])
   end
+  prepared = buffers[depth]
+  resize!(prepared, nargs)
+  prepared
 end
 
-function prepare_args(context::Context, spec::PrimitiveSpec, args::Vector{Any})
-  modes = cached_primitive_modes(spec)
+@inline function release_prepared_args!(runtime::RuntimeState)
+  runtime.prepared_arg_depth[] -= 1
+  nothing
+end
+
+@inline function acquire_agent_iteration_buffer!(
+  runtime::RuntimeState,
+  agents::AbstractVector{<:AbstractAgent})
+  depth = runtime.agent_iteration_depth[] + 1
+  runtime.agent_iteration_depth[] = depth
+  buffers = runtime.agent_iteration_buffers
+  if depth > length(buffers)
+    push!(buffers, AbstractAgent[])
+  end
+  prepared = buffers[depth]
+  resize!(prepared, length(agents))
+  @inbounds for i in eachindex(agents)
+    prepared[i] = agents[i]
+  end
+  prepared
+end
+
+@inline function release_agent_iteration_buffer!(runtime::RuntimeState)
+  runtime.agent_iteration_depth[] -= 1
+  nothing
+end
+
+@inline function acquire_scope_stack_buffer!(
+  runtime::RuntimeState,
+  scopes::Vector{Dict{String, Any}},
+  frame::Union{Nothing, Dict{String, Any}}=nothing)
+  depth = runtime.scope_stack_depth[] + 1
+  runtime.scope_stack_depth[] = depth
+  buffers = runtime.scope_stack_buffers
+  if depth > length(buffers)
+    push!(buffers, Dict{String, Any}[])
+  end
+  prepared = buffers[depth]
+  count = length(scopes)
+  extra = frame === nothing ? 0 : 1
+  resize!(prepared, count + extra)
+  count > 0 && copyto!(prepared, 1, scopes, 1, count)
+  frame === nothing || (prepared[count + 1] = frame)
+  prepared
+end
+
+@inline function release_scope_stack_buffer!(runtime::RuntimeState)
+  runtime.scope_stack_depth[] -= 1
+  nothing
+end
+
+@inline function prepare_eval_args!(prepared::Vector{Any}, context::Context, args::Vector{Any})
+  @inbounds for i in eachindex(args)
+    prepared[i] = eval_expr(context, args[i])
+  end
+  prepared
+end
+
+function prepare_args!(prepared::Vector{Any}, context::Context, spec::PrimitiveSpec, args::Vector{Any})
   nargs = length(args)
+  modes = spec.modes
   nmodes = length(modes)
 
-  # Fast path: all modes are :eval (most common case)
-  all_eval = true
-  for i in 1:min(nargs, nmodes)
-    if @inbounds modes[i] != :eval
-      all_eval = false
-      break
-    end
-  end
-  if all_eval
-    prepared = Vector{Any}(undef, nargs)
+  if spec.all_eval_modes
     @inbounds for i in 1:nargs
       prepared[i] = eval_expr(context, args[i])
     end
     return prepared
   end
 
-  if nmodes < nargs
-    modes = vcat(modes, fill(:eval, nargs - nmodes))
-  end
-
-  prepared = Vector{Any}(undef, nargs)
   @inbounds for i in 1:nargs
     arg = args[i]
-    mode = modes[i]
+    mode = i <= nmodes ? modes[i] : :eval
     if mode == :eval
-      prepared[i] = eval_expr(context, arg)
+      if arg isa BlockNode
+        # BlockNode ended up in :eval position due to optional arg skipping
+        prepared[i] = arg
+      else
+        prepared[i] = eval_expr(context, arg)
+      end
     elseif mode == :block || mode == :code_block
       prepared[i] = arg
     elseif mode == :reporter_block
@@ -3785,29 +4119,126 @@ function eval_boolean_reporter(context::Context, call::ReporterCall)
   throw(LogoRuntimeError("unknown boolean reporter $(call.name)"))
 end
 
+function eval_comparison_reporter(context::Context, call::ReporterCall)
+  left = eval_expr(context, call.args[1])
+  right = eval_expr(context, call.args[2])
+  if call.name == "="
+    return logo_equal(left, right)
+  elseif call.name == "!="
+    return !logo_equal(left, right)
+  end
+  ordering = logo_compare(context.runtime.model, left, right, call.name)
+  if call.name == ">"
+    return ordering > 0
+  elseif call.name == "<"
+    return ordering < 0
+  elseif call.name == ">="
+    return ordering >= 0
+  elseif call.name == "<="
+    return ordering <= 0
+  end
+  throw(LogoRuntimeError("unknown comparison reporter $(call.name)"))
+end
+
 function call_reporter!(context::Context, call::ReporterCall)
+  # Fast path: already-resolved primitive (skips all string comparisons)
+  cached = call.cached_prim
+  if cached !== nothing
+    spec = cached::PrimitiveSpec
+    prepared = acquire_prepared_args!(context.runtime, length(call.args))
+    try
+      prepare_args!(prepared, context, spec, call.args)
+      return spec.evaluator(context, prepared)
+    finally
+      release_prepared_args!(context.runtime)
+    end
+  end
+
+  # Special-case reporters needing lazy/compound evaluation
   if call.name == "IFELSE-VALUE"
     return ifelse_value(context, call.args)
   elseif call.name == "NOT" || call.name == "AND" || call.name == "OR" || call.name == "XOR"
     return eval_boolean_reporter(context, call)
+  elseif call.name == "=" || call.name == "!=" || call.name == ">" || call.name == "<" || call.name == ">=" || call.name == "<="
+    return eval_comparison_reporter(context, call)
+  elseif call.name == "COUNT"
+    value = count_with_fastpath(context, call)
+    value !== nothing && return value
+    value = count_on_fastpath(context, call)
+    value !== nothing && return value
+  elseif call.name == "ANY?"
+    value = any_turtles_here_fastpath(context, call)
+    value !== nothing && return value
+    value = any_with_fastpath(context, call)
+    value !== nothing && return value
+  elseif call.name == "ONE-OF"
+    value = one_of_with_fastpath(context, call)
+    value !== nothing && return value
+  elseif call.name == "SUM"
+    value = sum_of_fastpath(context, call)
+    value !== nothing && return value
+  elseif call.name == "MEAN"
+    value = mean_of_fastpath(context, call)
+    value !== nothing && return value
   end
 
   spec = get_reporter(context.runtime.registry, call.name)
   if spec !== nothing
+    call.cached_prim = spec
     agent_allowed(spec.syntax.agent_classes, agent_kind(context.agent)) ||
       throw(LogoRuntimeError("$(call.name) is not allowed for the current agent"))
-    return spec.evaluator(context, prepare_args(context, spec, call.args))
+    prepared = acquire_prepared_args!(context.runtime, length(call.args))
+    try
+      prepare_args!(prepared, context, spec, call.args)
+      return spec.evaluator(context, prepared)
+    finally
+      release_prepared_args!(context.runtime)
+    end
   end
 
   procedure = get(context.runtime.model.procedures, call.name, nothing)
   procedure !== nothing && procedure.is_reporter || throw(LogoRuntimeError("unknown reporter $(call.name)"))
-  args = Any[eval_expr(context, arg) for arg in call.args]
-  invoke_procedure!(context, procedure, args)
+  prepared = acquire_prepared_args!(context.runtime, length(call.args))
+  try
+    prepare_eval_args!(prepared, context, call.args)
+    return invoke_procedure!(context, procedure, prepared)
+  finally
+    release_prepared_args!(context.runtime)
+  end
 end
 
 eval_expr(context::Context, expr::ReporterCall) = call_reporter!(context, expr)
 
+@inline function symbol_arg_name(arg)
+  arg isa SymbolArg || throw(LogoRuntimeError("expected a symbolic argument"))
+  arg.name
+end
+
+@inline function command_block_arg(arg)
+  arg isa BlockNode || throw(LogoRuntimeError("expected a command block"))
+  arg
+end
+
+@inline function reporter_block_arg(arg)
+  arg isa ReporterBlockNode || throw(LogoRuntimeError("expected a reporter block"))
+  arg
+end
+
 function execute_stmt!(context::Context, stmt::CommandCall)
+  # Fast path: already-resolved primitive command (skips all string comparisons)
+  cached = stmt.cached_prim
+  if cached !== nothing
+    spec = cached::PrimitiveSpec
+    prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
+    try
+      prepare_args!(prepared, context, spec, stmt.args)
+      spec.evaluator(context, prepared)
+    finally
+      release_prepared_args!(context.runtime)
+    end
+    return nothing
+  end
+
   if stmt.name == "FOREACH"
     length(stmt.args) >= 2 || throw(LogoRuntimeError("foreach expects at least one list and an anonymous command"))
     values = Any[eval_expr(context, arg) for arg in stmt.args[1:(end - 1)]]
@@ -3816,117 +4247,308 @@ function execute_stmt!(context::Context, stmt::CommandCall)
     return nothing
   elseif stmt.name == "EVERY"
     return execute_every!(context, stmt)
+  elseif stmt.name == "LET"
+    name = symbol_arg_name(stmt.args[1])
+    scope = current_scope(context)
+    haskey(scope, name) && throw(LogoRuntimeError("There is already a local variable here called $(name)"))
+    scope[name] = eval_expr(context, stmt.args[2])
+    return nothing
+  elseif stmt.name == "SET"
+    assign_variable!(context, symbol_arg_name(stmt.args[1]), eval_expr(context, stmt.args[2]))
+    return nothing
+  elseif stmt.name == "IF"
+    logical(eval_expr(context, stmt.args[1])) && execute_block!(context, command_block_arg(stmt.args[2]))
+    return nothing
+  elseif stmt.name == "IFELSE"
+    execute_block!(context, logical(eval_expr(context, stmt.args[1])) ? command_block_arg(stmt.args[2]) : command_block_arg(stmt.args[3]))
+    return nothing
+  elseif stmt.name == "REPEAT"
+    count = Int(floor(numeric(eval_expr(context, stmt.args[1]))))
+    count >= 0 || throw(LogoRuntimeError("repeat expects a non-negative count"))
+    block = command_block_arg(stmt.args[2])
+    for _ in 1:count
+      execute_block!(context, block)
+    end
+    return nothing
+  elseif stmt.name == "ASK"
+    target = eval_expr(context, stmt.args[1])
+    block = command_block_arg(stmt.args[2])
+    if target isa AbstractAgent
+      run_block_for_agents!(context, target, block, true)
+    else
+      run_block_for_agents!(context, coerce_agents(context.runtime.world, target), block, true)
+    end
+    return nothing
+  elseif stmt.name == "ASK-CONCURRENT"
+    run_block_for_agents!(context, require_agentset_input(context.runtime.world, eval_expr(context, stmt.args[1]), "ASK-CONCURRENT"), command_block_arg(stmt.args[2]), true)
+    return nothing
+  elseif stmt.name == "WHILE"
+    condition = reporter_block_arg(stmt.args[1])
+    body = command_block_arg(stmt.args[2])
+    while logical(eval_reporter_block(context, condition, context.agent, context.caller))
+      execute_block!(context, body)
+    end
+    return nothing
   end
 
   spec = get_command(context.runtime.registry, stmt.name)
   if spec !== nothing
+    stmt.cached_prim = spec
     agent_allowed(spec.syntax.agent_classes, agent_kind(context.agent)) ||
       throw(LogoRuntimeError("$(stmt.name) is not allowed for the current agent"))
-    spec.evaluator(context, prepare_args(context, spec, stmt.args))
+    prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
+    try
+      prepare_args!(prepared, context, spec, stmt.args)
+      spec.evaluator(context, prepared)
+    finally
+      release_prepared_args!(context.runtime)
+    end
     return nothing
   end
 
   procedure = get(context.runtime.model.procedures, stmt.name, nothing)
   procedure !== nothing && !procedure.is_reporter || throw(LogoRuntimeError("unknown command $(stmt.name)"))
-  args = Any[eval_expr(context, arg) for arg in stmt.args]
-  invoke_procedure!(context, procedure, args)
+  prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
+  try
+    prepare_eval_args!(prepared, context, stmt.args)
+    invoke_procedure!(context, procedure, prepared)
+  finally
+    release_prepared_args!(context.runtime)
+  end
   nothing
 end
 
-function execute_block!(context::Context, block::BlockNode; push_scope::Bool=true)
-  if push_scope
-    d = _get_scope_dict()
+function execute_block!(context::Context, block::BlockNode, push_scope::Bool)
+  use_scope = push_scope && block.creates_scope
+  reusable_scope = use_scope && block.reusable_scope
+  d = nothing
+  statements = block.statements
+  count = length(statements)
+  if count == 0
+    return nothing
+  elseif !use_scope
+    return execute_noscope_block!(context, statements)
+  end
+  agent_is_live(context.agent) || return nothing
+  if use_scope
+    d = reusable_scope ? _get_scope_dict() : Dict{String, Any}()
     push!(context.locals, d)
   end
   try
-    for stmt in block.statements
-      agent_is_live(context.agent) || break
-      execute_stmt!(context, stmt)
-      agent_is_live(context.agent) || break
+    @inbounds begin
+      execute_stmt!(context, statements[1])
+      for index in 2:count
+        agent_is_live(context.agent) || break
+        execute_stmt!(context, statements[index])
+      end
     end
   finally
-    if push_scope
-      d = pop!(context.locals)
-      _return_scope_dict!(d)
+    if use_scope
+      pop!(context.locals)
+      reusable_scope && _return_scope_dict!(d::Dict{String, Any})
     end
   end
   nothing
 end
+
+execute_block!(context::Context, block::BlockNode) = execute_block!(context, block, true)
+
+@inline function execute_noscope_block!(context::Context, statements::Vector{AbstractStmt})
+  count = length(statements)
+  count == 0 && return nothing
+  agent_is_live(context.agent) || return nothing
+  @inbounds begin
+    execute_stmt!(context, statements[1])
+    for index in 2:count
+      agent_is_live(context.agent) || return nothing
+      execute_stmt!(context, statements[index])
+    end
+  end
+  nothing
+end
+
+@inline function single_noscope_stmt(block::BlockNode)
+  block.creates_scope && return nothing
+  length(block.statements) == 1 || return nothing
+  block.statements[1]::CommandCall
+end
+
+@inline function noscope_statements(block::BlockNode)
+  block.creates_scope && return nothing
+  length(block.statements) > 1 || return nothing
+  block.statements
+end
+
+@inline function execute_block_fast!(
+  context::Context,
+  block::BlockNode,
+  direct_stmt::Union{Nothing, CommandCall},
+  direct_stmts::Union{Nothing, Vector{AbstractStmt}},
+  push_scope::Bool)
+  if direct_stmt !== nothing
+    execute_stmt!(context, direct_stmt)
+  elseif direct_stmts !== nothing
+    execute_noscope_block!(context, direct_stmts)
+  else
+    execute_block!(context, block, push_scope)
+  end
+end
+
+@inline function simple_report_expr(procedure::ProcedureSpec)
+  length(procedure.body.statements) == 1 || return nothing
+  stmt = procedure.body.statements[1]
+  stmt isa CommandCall || return nothing
+  stmt.name == "REPORT" || return nothing
+  length(stmt.args) == 1 || return nothing
+  stmt.args[1]
+end
+
+@inline function restore_procedure_context!(
+  context::Context,
+  saved_locals::Vector{Dict{String, Any}},
+  saved_scope_depth::Int,
+  saved_every_state::Dict{Tuple{Int, Any}, UInt64},
+  child_every_state::Union{Nothing, Dict{Tuple{Int, Any}, UInt64}},
+  frame::Dict{String, Any},
+  reusable_frame::Bool)
+  context.locals = saved_locals
+  context.string_scope_depth = saved_scope_depth
+  restore_every_state!(context, saved_every_state, child_every_state)
+  release_scope_stack_buffer!(context.runtime)
+  reusable_frame && _return_scope_dict!(frame)
+  nothing
+end
+
+@inline function restore_procedure_context!(
+  context::Context,
+  saved_locals::Vector{Dict{String, Any}},
+  saved_scope_depth::Int,
+  saved_every_state::Dict{Tuple{Int, Any}, UInt64},
+  child_every_state::Union{Nothing, Dict{Tuple{Int, Any}, UInt64}})
+  current_locals = context.locals
+  context.locals = saved_locals
+  context.string_scope_depth = saved_scope_depth
+  restore_every_state!(context, saved_every_state, child_every_state)
+  resize!(current_locals, 0)
+  release_scope_stack_buffer!(context.runtime)
+  nothing
+end
+
+@inline procedure_needs_frame(procedure::ProcedureSpec) =
+  !isempty(procedure.inputs) || procedure.body.creates_scope || !procedure.reusable_frame
 
 function invoke_procedure!(context::Context, procedure::ProcedureSpec, args::Vector{Any})
   length(args) == length(procedure.inputs) ||
     throw(LogoRuntimeError("procedure $(procedure.name) expected $(length(procedure.inputs)) arguments"))
 
-  frame = _get_scope_dict()
-  for i in eachindex(procedure.inputs)
-    frame[procedure.inputs[i]] = args[i]
-  end
-
   # Save context state and reuse the same context to avoid Context allocation
   saved_locals = context.locals
   saved_scope_depth = context.string_scope_depth
   saved_every_state = context.every_state
-  context.locals = Dict{String, Any}[frame]
-  context.string_scope_depth = 1
-  context.every_state = Dict{Tuple{Int, Any}, UInt64}()
+  child_every_state = maybe_acquire_every_state!(context, procedure.body.uses_every)
+  needs_frame = procedure_needs_frame(procedure)
+  reusable_frame = procedure.reusable_frame
+  direct_stmt = procedure.is_reporter ? nothing : single_noscope_stmt(procedure.body)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(procedure.body) : nothing
+  if needs_frame
+    frame = task_scope(procedure.inputs, args, reusable_frame)
+    context.locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK, frame)
+    context.string_scope_depth = 1
+  else
+    frame = nothing
+    context.locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK)
+    context.string_scope_depth = 0
+  end
 
   if procedure.is_reporter
-    try
-      execute_block!(context, procedure.body; push_scope=false)
-    catch signal
-      if signal isa ReportSignal
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
-        return signal.value
-      elseif signal isa StopSignal
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
-        throw(stop_inside_reporter_error())
-      else
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
+    direct_expr = simple_report_expr(procedure)
+    if direct_expr !== nothing
+      try
+        value = eval_expr(context, direct_expr)
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        return value
+      catch signal
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        if signal isa StopSignal
+          throw(stop_inside_reporter_error())
+        elseif signal isa ReportSignal
+          return signal.value
+        end
         rethrow()
       end
     end
-    context.locals = saved_locals
-    context.string_scope_depth = saved_scope_depth
-    context.every_state = saved_every_state
-    _return_scope_dict!(frame)
+    try
+      execute_block_fast!(context, procedure.body, nothing, direct_stmts, false)
+    catch signal
+      if signal isa ReportSignal
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        return signal.value
+      elseif signal isa StopSignal
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        throw(stop_inside_reporter_error())
+      else
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        rethrow()
+      end
+    end
+    if needs_frame
+      restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+    else
+      restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+    end
     throw(LogoRuntimeError("the $(procedure.name) procedure failed to report a result"))
   else
     try
-      execute_block!(context, procedure.body; push_scope=false)
+      execute_block_fast!(context, procedure.body, direct_stmt, direct_stmts, false)
     catch signal
       if signal isa StopSignal
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
-        return nothing
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        return :stop
       elseif signal isa ReportSignal
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
         throw(report_outside_reporter_error())
       else
-        context.locals = saved_locals
-        context.string_scope_depth = saved_scope_depth
-        context.every_state = saved_every_state
-        _return_scope_dict!(frame)
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
         rethrow()
       end
     end
-    context.locals = saved_locals
-    context.string_scope_depth = saved_scope_depth
-    context.every_state = saved_every_state
-    _return_scope_dict!(frame)
+    if needs_frame
+      restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+    else
+      restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+    end
     return nothing
   end
 end
@@ -3935,8 +4557,16 @@ function call!(runtime::RuntimeState, procedure_name::AbstractString, args::Vect
   name = canonical_name(procedure_name)
   procedure = get(runtime.model.procedures, name, nothing)
   procedure !== nothing || throw(LogoRuntimeError("unknown procedure $procedure_name"))
-  root = Context(runtime, runtime.world.observer, [Dict{String, Any}()], nothing, false, 1)
-  invoke_procedure!(root, procedure, args)
+  root_every_state = procedure.body.uses_every ? _get_every_state_dict() : EMPTY_EVERY_STATE
+  root = Context(runtime, runtime.world.observer, EMPTY_SCOPE_STACK, nothing, false, 1, root_every_state)
+  result = nothing
+  try
+    result = invoke_procedure!(root, procedure, args)
+  finally
+    root_every_state === EMPTY_EVERY_STATE || _return_every_state_dict!(root_every_state)
+  end
+  # Reporters return their value; commands return whether stop was called
+  procedure.is_reporter ? result : (result === :stop)
 end
 
 turtle_singular_name(model::ModelSpec, breed::String) =
@@ -3972,7 +4602,15 @@ function ensure_live_agent(world::World, agent::Link)
   agent
 end
 
-live_agentset_members(agentset::AgentSet) = AbstractAgent[agent for agent in agentset]
+function live_agentset_members(agentset::AgentSet)
+  members = current_agentset_members(agentset)
+  agentset.all_live && return members
+  live = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  for agent in members
+    agent_is_live(agent) && push!(live, agent)
+  end
+  live
+end
 
 function coerce_agents(world::World, value)
   if value isa AgentSet
@@ -4106,7 +4744,7 @@ function collect_agentset_members!(
     return
   elseif value isa AgentSet
     value.kind == kind || agentset_builder_error(opname, kind, value; from_list=from_list)
-    for agent in value
+    @for_agents agent value begin
       seen[agent_sort_key(model, agent)] = agent
     end
     return
@@ -4142,7 +4780,7 @@ function build_agentset(opname::AbstractString, model::ModelSpec, kind::AgentKin
   end
 
   members = sort_agents(model, collect(Base.values(seen)))
-  AgentSet(kind, members; breed=built_agentset_breed(kind, members))
+  owned_agentset(kind, members; breed=built_agentset_breed(kind, members))
 end
 
 function coerce_turtles(world::World, value)
@@ -4176,19 +4814,46 @@ function coerce_turtle_collection(world::World, value, opname::AbstractString; s
 end
 
 function other_agents(agentset::AgentSet, current::AbstractAgent)
-  members = [agent for agent in agentset if !same_agent(agent, current)]
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  agentset.kind == agent_kind(current) || return agentset
+  if current isa Turtle && agentset.kind == TurtleKind
+    breed = agentset.breed
+    if breed !== nothing && breed != "TURTLES" && current.breed != breed
+      return agentset
+    end
+  elseif current isa Link && agentset.kind == LinkKind
+    breed = agentset.breed
+    if breed !== nothing && breed != "LINKS" && current.breed != breed
+      return agentset
+    end
+  end
+
+  members = sizehint!(AbstractAgent[], max(agentset_capacity(agentset) - 1, 0))
+  removed = false
+  @for_agents agent agentset begin
+    if same_agent(agent, current)
+      removed = true
+    else
+      push!(members, agent)
+    end
+  end
+  removed ? owned_agentset(agentset.kind, members; breed=agentset.breed) : agentset
 end
 
 function who_are_not(agentset::AgentSet, excluded::AgentSet)
   blocked = live_agentset_members(excluded)
-  members = [agent for agent in agentset if !any(other -> same_agent(agent, other), blocked)]
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  @for_agents agent agentset begin
+    !any(other -> same_agent(agent, other), blocked) && push!(members, agent)
+  end
+  owned_agentset(agentset.kind, members; breed=agentset.breed)
 end
 
 function who_are_not(agentset::AgentSet, excluded::AbstractAgent)
-  members = [agent for agent in agentset if !same_agent(agent, excluded)]
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  @for_agents agent agentset begin
+    !same_agent(agent, excluded) && push!(members, agent)
+  end
+  owned_agentset(agentset.kind, members; breed=agentset.breed)
 end
 
 function create_links_from_turtle!(
@@ -4203,15 +4868,15 @@ function create_links_from_turtle!(
   for target in coerce_turtles(context.runtime.world, target_value)
     same_agent(parent, target) && continue
     src, dst =
-      mode == :to ? (parent, target) :
-      mode == :from ? (target, parent) :
+      (mode == :to || mode == :out) ? (parent, target) :
+      (mode == :from || mode == :in) ? (target, parent) :
       (parent, target)
-    link = create_link!(context.runtime.world, src, dst; breed=breed, directed=(canonical_name(breed) == "LINKS" ? mode != :with : nothing))
+    link = create_link!(context.runtime.world, src, dst; breed=breed, directed=(canonical_name(breed) == "LINKS" ? (mode != :with && mode != :all) : nothing))
     link === nothing && continue
     push!(created, link)
   end
 
-  block !== nothing && run_block_for_agents!(context, created, block; random_order=true)
+  block !== nothing && run_block_for_agents!(context, created, block, true)
 
   created
 end
@@ -4242,10 +4907,16 @@ function one_of(rng::AbstractRNG, value)
         # Fallback to reservoir if too many dead
       end
     end
+    # Fast path for static owned agentsets where all members are live
+    if !value.dynamic && value.all_live
+      m = value.members
+      isempty(m) && return NOBODY
+      return @inbounds m[rand(rng, 1:length(m))]
+    end
     # Fallback: reservoir sampling (k=1), zero allocation
     chosen = NOBODY
     n = 0
-    for agent in value
+    @for_agents agent value begin
       n += 1
       if rand(rng, 1:n) == 1
         chosen = agent
@@ -4331,7 +5002,7 @@ end
 function collection_butfirst(value)
   if value isa AbstractVector
     isempty(value) && throw(LogoRuntimeError("BF got an empty list as input."))
-    return length(value) == 1 ? Any[] : Any[value[2:end]...]
+    return length(value) == 1 ? Any[] : copy(@view value[2:end])
   elseif value isa AbstractString
     chars = collect(String(value))
     isempty(chars) && throw(LogoRuntimeError("bf got an empty string as input."))
@@ -4343,7 +5014,7 @@ end
 function collection_butlast(value)
   if value isa AbstractVector
     isempty(value) && throw(LogoRuntimeError("BL got an empty list as input."))
-    return length(value) == 1 ? Any[] : Any[value[1:(end - 1)]...]
+    return length(value) == 1 ? Any[] : copy(@view value[1:(end - 1)])
   elseif value isa AbstractString
     chars = collect(String(value))
     isempty(chars) && throw(LogoRuntimeError("bl got an empty string as input."))
@@ -4453,8 +5124,8 @@ function extreme_agents(context::Context, agentset::AgentSet, block::ReporterBlo
   winning_value = mode == :max ? -Inf : Inf
   winners = AbstractAgent[]
 
-  for agent in agentset
-    value = eval_reporter_block(context, block; agent=agent, caller=block_caller(context))
+  @for_agents agent agentset begin
+    value = eval_reporter_block(context, block, agent, block_caller(context))
     is_logo_number(value) || continue
     number = Float64(value)
     if mode == :max
@@ -4476,7 +5147,7 @@ function extreme_agents(context::Context, agentset::AgentSet, block::ReporterBlo
     end
   end
 
-  AgentSet(agentset.kind, winners; breed=agentset.breed)
+  owned_agentset(agentset.kind, winners; breed=agentset.breed)
 end
 
 function extreme_agent(context::Context, agentset::AgentSet, block::ReporterBlockNode; mode::Symbol)
@@ -4487,17 +5158,18 @@ end
 function extreme_n_agents(context::Context, count_value, agentset::AgentSet, block::ReporterBlockNode; mode::Symbol)
   opname = mode == :max ? "max-n-of" : "min-n-of"
   remaining = sample_size(count_value, opname)
-  total = length(agentset)
+  members = live_agentset_members(agentset)
+  total = length(members)
   remaining <= total || throw(LogoRuntimeError("requested $remaining random agents from a set of only $total agents"))
 
   ordered_members =
     total > 1 ?
-    live_agentset_members(agentset)[randperm(context.runtime.world.rng, total)] :
-    live_agentset_members(agentset)
+    members[randperm(context.runtime.world.rng, total)] :
+    members
 
   grouped = Dict{Float64, Vector{AbstractAgent}}()
   for agent in ordered_members
-    value = eval_reporter_block(context, block; agent=agent, caller=block_caller(context))
+    value = eval_reporter_block(context, block, agent, block_caller(context))
     is_logo_number(value) || continue
     push!(get!(grouped, Float64(value), AbstractAgent[]), agent)
   end
@@ -5009,14 +5681,14 @@ end
 
 invalid_points_error() = LogoRuntimeError("Invalid list of points")
 
-function point_query_patch_keys(world::World, points)
+function point_query_patch_keys(world::World, points, origin_x::Float64, origin_y::Float64)
   points isa AbstractVector || throw(invalid_points_error())
   patch_keys = Set{Tuple{Int, Int}}()
   for point in points
     point isa AbstractVector || throw(invalid_points_error())
     length(point) == 2 || throw(invalid_points_error())
     is_logo_number(point[1]) && is_logo_number(point[2]) || throw(invalid_points_error())
-    patch = maybe_patch(world, numeric(point[1]), numeric(point[2]))
+    patch = maybe_patch(world, origin_x + numeric(point[1]), origin_y + numeric(point[2]))
     patch === NOBODY && continue
     push!(patch_keys, (patch.pxcor, patch.pycor))
   end
@@ -5036,14 +5708,14 @@ function source_patch_keys(world::World, value, opname::AbstractString)
   elseif value isa AgentSet
     if value.kind == PatchKind
       patch_keys = Set{Tuple{Int, Int}}()
-      for member in value
+      @for_agents member value begin
         patch = member::Patch
         push!(patch_keys, (patch.pxcor, patch.pycor))
       end
       return patch_keys
     elseif value.kind == TurtleKind
       patch_keys = Set{Tuple{Int, Int}}()
-      for member in value
+      @for_agents member value begin
         patch = current_patch(world, member::Turtle)
         push!(patch_keys, (patch.pxcor, patch.pycor))
       end
@@ -5053,24 +5725,24 @@ function source_patch_keys(world::World, value, opname::AbstractString)
   throw(point_query_source_error(opname))
 end
 
-function agents_at_points(world::World, agentset::AgentSet, points)
+function agents_at_points(world::World, agentset::AgentSet, points, origin_x::Float64, origin_y::Float64)
   spatial_query_agentset(agentset, "at-points")
-  patch_keys = point_query_patch_keys(world, points)
+  patch_keys = point_query_patch_keys(world, points, origin_x, origin_y)
   if agentset.kind == PatchKind
-    members = Patch[]
-    for member in agentset
+    members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+    @for_agents member agentset begin
       patch = member::Patch
       (patch.pxcor, patch.pycor) in patch_keys && push!(members, patch)
     end
-    return AgentSet(PatchKind, members)
+    return owned_agentset(PatchKind, members)
   end
-  members = Turtle[]
-  for member in agentset
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  @for_agents member agentset begin
     turtle = member::Turtle
     patch = current_patch(world, turtle)
     (patch.pxcor, patch.pycor) in patch_keys && push!(members, turtle)
   end
-  AgentSet(TurtleKind, members; breed=agentset.breed)
+  owned_agentset(TurtleKind, members; breed=agentset.breed)
 end
 
 function turtles_on_sources(
@@ -5080,7 +5752,7 @@ function turtles_on_sources(
   opname::AbstractString="turtles-on")
   canonical_breed = breed === nothing ? "TURTLES" : canonical_name(breed)
   breed === nothing || has_turtle_breed(world.model, canonical_breed) || throw(LogoRuntimeError("unknown turtle breed $breed"))
-  members = Turtle[]
+  members = AbstractAgent[]
   # Collect patches from source, then lookup turtles via patch.turtles_here
   if value isa Patch
     _collect_turtles_on_patch!(members, world, value, breed, canonical_breed)
@@ -5089,12 +5761,12 @@ function turtles_on_sources(
     _collect_turtles_on_patch!(members, world, patch, breed, canonical_breed)
   elseif value isa AgentSet
     if value.kind == PatchKind
-      for member in value
+      @for_agents member value begin
         _collect_turtles_on_patch!(members, world, member::Patch, breed, canonical_breed)
       end
     elseif value.kind == TurtleKind
       seen = Set{Int}()
-      for member in value
+      @for_agents member value begin
         patch = current_patch(world, member::Turtle)
         for id in patch.turtles_here
           id in seen && continue
@@ -5110,10 +5782,62 @@ function turtles_on_sources(
   else
     throw(point_query_source_error(opname))
   end
-  AgentSet(TurtleKind, members; breed=canonical_breed)
+  owned_agentset(TurtleKind, members; breed=canonical_breed)
 end
 
-function _collect_turtles_on_patch!(members::Vector{Turtle}, world::World, patch::Patch, breed, canonical_breed::String)
+function count_turtles_on_sources(
+  world::World,
+  value;
+  breed::Union{Nothing, AbstractString}=nothing,
+  opname::AbstractString="turtles-on")
+  canonical_breed = breed === nothing ? "TURTLES" : canonical_name(breed)
+  breed === nothing || has_turtle_breed(world.model, canonical_breed) || throw(LogoRuntimeError("unknown turtle breed $breed"))
+  if value isa Patch
+    return _count_turtles_on_patch(world, value, breed, canonical_breed)
+  elseif value isa Turtle
+    return _count_turtles_on_patch(world, current_patch(world, value), breed, canonical_breed)
+  elseif value isa AgentSet
+    if value.kind == PatchKind
+      matched = 0
+      members = value.all_live ? current_agentset_members(value) : live_agentset_members(value)
+      for member in members
+        matched += _count_turtles_on_patch(world, member::Patch, breed, canonical_breed)
+      end
+      return matched
+    elseif value.kind == TurtleKind
+      if breed === nothing
+        matched = 0
+        seen = Set{Tuple{Int, Int}}()
+        members = value.all_live ? current_agentset_members(value) : live_agentset_members(value)
+        for member in members
+          patch = current_patch(world, member::Turtle)
+          key = (patch.pxcor, patch.pycor)
+          key in seen && continue
+          push!(seen, key)
+          matched += length(patch.turtles_here)
+        end
+        return matched
+      end
+      matched = 0
+      seen = Set{Int}()
+      members = value.all_live ? current_agentset_members(value) : live_agentset_members(value)
+      for member in members
+        patch = current_patch(world, member::Turtle)
+        for id in patch.turtles_here
+          id in seen && continue
+          push!(seen, id)
+          turtle = maybe_turtle_by_id(world, id)
+          turtle === nothing && continue
+          (breed === nothing || turtle.breed == canonical_breed) && (matched += 1)
+        end
+      end
+      return matched
+    end
+  end
+  throw(point_query_source_error(opname))
+end
+
+function _collect_turtles_on_patch!(members::Vector{AbstractAgent}, world::World, patch::Patch, breed, canonical_breed::String)
   for id in patch.turtles_here
     turtle = maybe_turtle_by_id(world, id)
     turtle === nothing && continue
@@ -5121,14 +5845,25 @@ function _collect_turtles_on_patch!(members::Vector{Turtle}, world::World, patch
   end
 end
 
+function _count_turtles_on_patch(world::World, patch::Patch, breed, canonical_breed::String)
+  breed === nothing && return length(patch.turtles_here)
+  matched = 0
+  for id in patch.turtles_here
+    turtle = maybe_turtle_by_id(world, id)
+    turtle === nothing && continue
+    (breed === nothing || turtle.breed == canonical_breed) && (matched += 1)
+  end
+  matched
+end
+
 function patches_on_sources(world::World, value; opname::AbstractString="patches-on")
   patch_keys = source_patch_keys(world, value, opname)
-  members = Patch[]
+  members = sizehint!(AbstractAgent[], length(world.patches))
   for member in all_patches(world)
     patch = member::Patch
     (patch.pxcor, patch.pycor) in patch_keys && push!(members, patch)
   end
-  AgentSet(PatchKind, members)
+  owned_agentset(PatchKind, members)
 end
 
 angular_difference(left::Real, right::Real) = abs(mod(Float64(left) - Float64(right) + 180.0, 360.0) - 180.0)
@@ -5143,8 +5878,14 @@ function agents_in_radius(
   radius = validate_radius(radius_value, opname)
   spatial_query_agentset(agentset, opname)
   source_x, source_y = agent_position(source)
-  members = sizehint!(AbstractAgent[], length(agentset))
-  for target in agentset
+
+  # Fast path: for turtle agentsets, use patch-grid spatial index
+  if agentset.kind == TurtleKind
+    return _agents_in_radius_spatial(world, source_x, source_y, agentset, radius, wrap)
+  end
+
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  @for_agents target agentset begin
     target isa Turtle || target isa Patch || throw(LogoRuntimeError("$(lowercase(opname)) expects a turtle or patch agentset"))
     target_x, target_y = agent_position(target)
     distance =
@@ -5153,7 +5894,73 @@ function agents_in_radius(
       distance_between_nowrap(world, source_x, source_y, target_x, target_y)
     distance <= radius + 1e-9 && push!(members, target)
   end
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  owned_agentset(agentset.kind, members; breed=agentset.breed)
+end
+
+# Patch-grid spatial index for turtle in-radius queries.
+# Instead of scanning all turtles, only check turtles on patches
+# within ceil(radius)+1 of the source position.
+function _agents_in_radius_spatial(
+  world::World,
+  source_x::Float64, source_y::Float64,
+  agentset::AgentSet,
+  radius::Float64,
+  wrap::Bool)
+
+  breed_filter = agentset.breed
+  threshold = radius + 1e-9
+  # Patch scan radius: a turtle at patch (px,py) can be at most ~0.5 from
+  # the patch center, so we need patches within ceil(radius + 0.5) of source.
+  patch_scan = ceil(Int, radius) + 1
+  ww = world_width(world)
+  wh = world_height(world)
+  min_px = world.min_pxcor
+  max_px = world.max_pxcor
+  min_py = world.min_pycor
+  max_py = world.max_pycor
+  src_px = round_patch_coord(source_x)
+  src_py = round_patch_coord(source_y)
+  x_wraps = axis_wraps(world, :x)
+  y_wraps = axis_wraps(world, :y)
+
+  members = AbstractAgent[]
+  # Clamp scan range to avoid visiting the same wrapped patch twice.
+  # On a torus of width ww, unique offsets span -(ww-1)÷2 .. ww÷2.
+  scan_x_neg = x_wraps ? min(patch_scan, (ww - 1) ÷ 2) : patch_scan
+  scan_x_pos = x_wraps ? min(patch_scan, ww ÷ 2) : patch_scan
+  scan_y_neg = y_wraps ? min(patch_scan, (wh - 1) ÷ 2) : patch_scan
+  scan_y_pos = y_wraps ? min(patch_scan, wh ÷ 2) : patch_scan
+
+  for dy_off in -scan_y_neg:scan_y_pos
+    py = src_py + dy_off
+    if y_wraps
+      py = min_py + mod(py - min_py, wh)
+    elseif py < min_py || py > max_py
+      continue
+    end
+    for dx_off in -scan_x_neg:scan_x_pos
+      px = src_px + dx_off
+      if x_wraps
+        px = min_px + mod(px - min_px, ww)
+      elseif px < min_px || px > max_px
+        continue
+      end
+      patch = world.patches[(ww * (max_py - py)) + (px - min_px) + 1]
+      for tid in patch.turtles_here
+        turtle = maybe_turtle_by_id(world, tid)
+        turtle === nothing && continue
+        if breed_filter !== nothing && breed_filter != "TURTLES"
+          turtle.breed == breed_filter || continue
+        end
+        dist = wrap ?
+          distance_between(world, source_x, source_y, turtle.xcor, turtle.ycor) :
+          distance_between_nowrap(world, source_x, source_y, turtle.xcor, turtle.ycor)
+        dist <= threshold && push!(members, turtle)
+      end
+    end
+  end
+
+  owned_agentset(TurtleKind, members; breed=agentset.breed)
 end
 
 function agents_in_cone(
@@ -5172,8 +5979,8 @@ function agents_in_cone(
   spatial_query_agentset(agentset, opname)
   source_x, source_y = agent_position(source)
   half_angle = angle / 2.0
-  members = sizehint!(AbstractAgent[], length(agentset))
-  for target in agentset
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  @for_agents target agentset begin
     target isa Turtle || target isa Patch || throw(LogoRuntimeError("$(lowercase(opname)) expects a turtle or patch agentset"))
     target_x, target_y = agent_position(target)
     distance =
@@ -5191,7 +5998,7 @@ function agents_in_cone(
       heading_towards_nowrap(world, source_x, source_y, target_x, target_y)
     angular_difference(heading, source.heading) <= half_angle + 1e-9 && push!(members, target)
   end
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  owned_agentset(agentset.kind, members; breed=agentset.breed)
 end
 
 function both_ends(world::World, link::Link)
@@ -5224,9 +6031,9 @@ function other_end(context::Context)
   throw(LogoRuntimeError("other-end is only available to turtles and links"))
 end
 
-function link_neighbor(world::World, turtle::Turtle, target; mode::Symbol=:all)
+function link_neighbor(world::World, turtle::Turtle, target; mode::Symbol=:all, breed::Union{String,Nothing}=nothing)
   target isa Turtle || throw(LogoRuntimeError("expected a turtle neighbor"))
-  any(neighbor -> same_agent(target, neighbor::Turtle), link_neighbors(world, turtle; mode=mode))
+  any(neighbor -> same_agent(target, neighbor::Turtle), link_neighbors(world, turtle; mode=mode, breed=breed))
 end
 
 sort_agents(model::ModelSpec, agents::AbstractVector{<:AbstractAgent}) =
@@ -5374,7 +6181,7 @@ function collection_sublist(value, start_value, end_value)
   end_index >= start_index || throw(LogoRuntimeError("sublist end must not be smaller than start"))
   start_index <= length(value) || throw(LogoRuntimeError("sublist start index out of bounds"))
   start_index == end_index && return Any[]
-  return Any[value[(start_index + 1):end_index]...]
+  return copy(@view value[(start_index + 1):end_index])
 end
 
 function collection_substring(value, start_value, end_value)
@@ -5457,7 +6264,7 @@ end
 
 function list_argument(value, opname::AbstractString)
   value isa AbstractVector || throw(LogoRuntimeError("$opname expects a list"))
-  Any[value...]
+  value
 end
 
 function parallel_lists(opname::AbstractString, values...)
@@ -5469,18 +6276,39 @@ function parallel_lists(opname::AbstractString, values...)
   lists
 end
 
+@inline reporter_task_minimum_inputs(task::ReporterTaskValue) = length(task.block.params)
+@inline reporter_task_minimum_inputs(task::PrimitiveReporterTaskValue) = first(primitive_input_bounds(task.spec.syntax))
+@inline reporter_task_minimum_inputs(task::ProcedureReporterTaskValue) = length(task.procedure.inputs)
+
+@inline command_task_minimum_inputs(task::CommandTaskValue) = length(task.task.params)
+@inline command_task_minimum_inputs(task::PrimitiveCommandTaskValue) = first(primitive_task_input_bounds(task.spec))
+@inline command_task_minimum_inputs(task::ProcedureCommandTaskValue) = length(task.procedure.inputs)
+
+function map_values(context::Context, task::AbstractReporterTaskValue, value)
+  minimum_inputs = reporter_task_minimum_inputs(task)
+  minimum_inputs <= 1 || throw(task_arity_error("reporter task", minimum_inputs, 1))
+  list = list_argument(value, "map")
+  results = sizehint!(Any[], length(list))
+  actuals = Vector{Any}(undef, 1)
+  for item in list
+    actuals[1] = item
+    push!(results, invoke_reporter_task(context, task, actuals))
+  end
+  results
+end
+
 function map_values(context::Context, task::AbstractReporterTaskValue, values...)
   lists = parallel_lists("map", values...)
-  minimum_inputs =
-    task isa ReporterTaskValue ? length(task.block.params) :
-    task isa PrimitiveReporterTaskValue ? first(primitive_input_bounds(task.spec.syntax)) :
-    length(task.procedure.inputs)
+  minimum_inputs = reporter_task_minimum_inputs(task)
   isempty(lists) && minimum_inputs > 0 && throw(task_arity_error("reporter task", minimum_inputs, 0))
   length(lists) >= minimum_inputs || throw(task_arity_error("reporter task", minimum_inputs, length(lists)))
   count = isempty(lists) ? 0 : length(first(lists))
-  results = Any[]
+  results = sizehint!(Any[], count)
+  actuals = Vector{Any}(undef, length(lists))
   for index in 1:count
-    actuals = Any[list[index] for list in lists]
+    for i in eachindex(lists)
+      @inbounds actuals[i] = lists[i][index]
+    end
     push!(results, invoke_reporter_task(context, task, actuals))
   end
   results
@@ -5488,9 +6316,11 @@ end
 
 function filter_values(context::Context, task::AbstractReporterTaskValue, value)
   list = list_argument(value, "filter")
-  results = Any[]
+  results = sizehint!(Any[], length(list))
+  actuals = Vector{Any}(undef, 1)
   for item in list
-    keep = invoke_reporter_task(context, task, Any[item])
+    actuals[1] = item
+    keep = invoke_reporter_task(context, task, actuals)
     keep isa Bool || throw(LogoRuntimeError("FILTER expected input to be a TRUE/FALSE but got $(keep) instead."))
     keep && push!(results, item)
   end
@@ -5501,8 +6331,11 @@ function reduce_values(context::Context, task::AbstractReporterTaskValue, value)
   list = list_argument(value, "reduce")
   isempty(list) && throw(LogoRuntimeError("reduce expects a non-empty list"))
   accumulator = list[1]
-  for item in list[2:end]
-    accumulator = invoke_reporter_task(context, task, Any[accumulator, item])
+  actuals = Vector{Any}(undef, 2)
+  for index in 2:length(list)
+    actuals[1] = accumulator
+    actuals[2] = list[index]
+    accumulator = invoke_reporter_task(context, task, actuals)
   end
   accumulator
 end
@@ -5553,14 +6386,19 @@ function classify_sort_on_key(model::ModelSpec, value)
 end
 
 function sort_on_values(context::Context, block::ReporterBlockNode, agentset::AgentSet)
-  items = shuffle(context.runtime.world.rng, Any[live_agentset_members(agentset)...])
+  members = live_agentset_members(agentset)
+  items = Vector{Any}(undef, length(members))
+  for i in eachindex(members)
+    @inbounds items[i] = members[i]
+  end
+  shuffle!(context.runtime.world.rng, items)
   length(items) <= 1 && return items
 
   expected_kind = nothing
   expected_label = ""
   keyed = Tuple{Any, Any}[]
   for item in items
-    key = eval_reporter_block(context, block; agent=item::AbstractAgent, caller=block_caller(context))
+    key = eval_reporter_block(context, block, item::AbstractAgent, block_caller(context))
     kind, order_key, label = classify_sort_on_key(context.runtime.model, key)
     if expected_kind === nothing
       expected_kind = kind
@@ -5580,14 +6418,14 @@ function ifelse_value(context::Context, args::Vector{Any})
     condition = logical(eval_expr(context, args[index]))
     block = args[index + 1]
     block isa ReporterBlockNode || throw(LogoRuntimeError("ifelse-value expects reporter blocks for branches"))
-    condition && return eval_reporter_block(context, block; agent=context.agent, caller=context.caller)
+    condition && return eval_reporter_block(context, block, context.agent, context.caller)
     index += 2
   end
 
   if index <= length(args)
     block = args[index]
     block isa ReporterBlockNode || throw(LogoRuntimeError("ifelse-value expects reporter blocks for branches"))
-    return eval_reporter_block(context, block; agent=context.agent, caller=context.caller)
+    return eval_reporter_block(context, block, context.agent, context.caller)
   end
 
   throw(LogoRuntimeError("IFELSE-VALUE found no true conditions and no else branch. If you don't wish to error when no conditions are true, add a final else branch."))
@@ -5636,7 +6474,7 @@ function run_string!(context::Context, source::AbstractString)
     catch err
       throw(runtime_parse_error(err))
     end
-  execute_block!(child, block; push_scope=false)
+  execute_block!(child, block, false)
   nothing
 end
 
@@ -6255,7 +7093,7 @@ function create_turtles_command!(
     color = ordered ? ordered_turtle_color(index) : nothing
     push!(newborns, create_turtle!(world; breed=canonical_breed, heading=heading, color=color))
   end
-  block !== nothing && run_block_for_agents!(context, newborns, block; random_order=true)
+  block !== nothing && run_block_for_agents!(context, newborns, block, true)
   nothing
 end
 
@@ -6298,7 +7136,7 @@ function hatch_turtles!(
       pen_mode=parent.pen_mode,
       own=inherited_hatch_own(world, parent, canonical_breed)))
   end
-  block !== nothing && run_block_for_agents!(context, newborns, block; random_order=true)
+  block !== nothing && run_block_for_agents!(context, newborns, block, true)
   nothing
 end
 
@@ -6319,7 +7157,7 @@ function sprout_turtles!(
   for _ in 1:count
     push!(newborns, create_turtle!(world; breed=canonical_breed, x=Float64(patch.pxcor), y=Float64(patch.pycor)))
   end
-  block !== nothing && run_block_for_agents!(context, newborns, block; random_order=true)
+  block !== nothing && run_block_for_agents!(context, newborns, block, true)
   nothing
 end
 
@@ -6337,29 +7175,240 @@ end
 function n_values(context::Context, count_value, task::AbstractReporterTaskValue)
   count = Int(floor(numeric(count_value)))
   count >= 0 || throw(LogoRuntimeError("n-values expects a non-negative count"))
-  Any[invoke_reporter_task(context, task, Any[Float64(index)]) for index in 0:(count - 1)]
+  results = sizehint!(Any[], count)
+  actuals = Vector{Any}(undef, 1)
+  for index in 0:(count - 1)
+    actuals[1] = Float64(index)
+    push!(results, invoke_reporter_task(context, task, actuals))
+  end
+  results
+end
+
+function foreach_values!(context::Context, task::AbstractCommandTaskValue, value)
+  minimum_inputs = command_task_minimum_inputs(task)
+  minimum_inputs <= 1 || throw(task_arity_error("anonymous procedure", minimum_inputs, 1))
+  list = list_argument(value, "foreach")
+  actuals = Vector{Any}(undef, 1)
+  for item in list
+    actuals[1] = item
+    invoke_command_task(context, task, actuals)
+  end
+  nothing
 end
 
 function foreach_values!(context::Context, task::AbstractCommandTaskValue, values...)
   lists = parallel_lists("foreach", values...)
+  minimum_inputs = command_task_minimum_inputs(task)
+  isempty(lists) && minimum_inputs > 0 && throw(task_arity_error("anonymous procedure", minimum_inputs, 0))
+  length(lists) >= minimum_inputs || throw(task_arity_error("anonymous procedure", minimum_inputs, length(lists)))
+  actuals = Vector{Any}(undef, length(lists))
   for index in 1:(isempty(lists) ? 0 : length(first(lists)))
-    actuals = Any[list[index] for list in lists]
+    for i in eachindex(lists)
+      @inbounds actuals[i] = lists[i][index]
+    end
     invoke_command_task(context, task, actuals)
   end
   nothing
 end
 
 function filter_agentset(context::Context, agentset::AgentSet, block::ReporterBlockNode)
-  members = sizehint!(AbstractAgent[], length(agentset))
-  for agent in agentset
-    logical(eval_reporter_block(context, block; agent=agent, caller=block_caller(context))) && push!(members, agent)
+  members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
+  caller = block_caller(context)
+  @for_agents agent agentset begin
+    logical(eval_reporter_block(context, block, agent, caller)) && push!(members, agent)
   end
-  AgentSet(agentset.kind, members; breed=agentset.breed)
+  owned_agentset(agentset.kind, members; breed=agentset.breed)
+end
+
+@inline function with_call_components(call::ReporterCall)
+  length(call.args) == 1 || return nothing
+  arg = call.args[1]
+  arg isa ReporterCall || return nothing
+  arg.name == "WITH" || return nothing
+  length(arg.args) == 2 || return nothing
+  arg.args[2] isa ReporterBlockNode || return nothing
+  arg.args
+end
+
+function count_with_fastpath(context::Context, call::ReporterCall)
+  with_args = with_call_components(call)
+  with_args === nothing && return nothing
+  base = eval_expr(context, with_args[1])
+  base isa AgentSet || return nothing
+  block = with_args[2]::ReporterBlockNode
+  caller = block_caller(context)
+  matched = 0
+  @for_agents agent base begin
+    logical(eval_reporter_block(context, block, agent, caller)) && (matched += 1)
+  end
+  Float64(matched)
+end
+
+"""
+Fast path for `any? turtles-here`, `any? other turtles-here`, and breed-here variants.
+Returns Bool or nothing (if pattern doesn't match).
+"""
+function any_turtles_here_fastpath(context::Context, call::ReporterCall)
+  length(call.args) == 1 || return nothing
+  arg = call.args[1]
+  arg isa ReporterCall || return nothing
+
+  # Detect `any? other X` wrapper
+  is_other = false
+  inner = arg
+  if arg.name == "OTHER" && length(arg.args) == 1
+    inner_arg = arg.args[1]
+    inner_arg isa ReporterCall || return nothing
+    is_other = true
+    inner = inner_arg
+  end
+
+  # Must be TURTLES-HERE (or a breed-here)
+  (inner.name == "TURTLES-HERE" || endswith(inner.name, "-HERE")) || return nothing
+  length(inner.args) == 0 || return nothing
+
+  agent = context.agent
+  (agent isa Turtle || agent isa Patch) || return nothing
+  world = context.runtime.world
+  patch = agent isa Patch ? agent : current_patch(world, agent)
+  th = patch.turtles_here
+
+  # Filter by breed if breed-here variant
+  breed_filter = inner.name == "TURTLES-HERE" ? nothing : rstrip_here(inner.name)
+
+  current_id = is_other && agent isa Turtle ? agent.id : -1
+
+  for id in th
+    id == current_id && continue
+    turtle = maybe_turtle_by_id(world, id)
+    turtle === nothing && continue
+    if breed_filter !== nothing && turtle.breed != breed_filter
+      continue
+    end
+    return true
+  end
+  return false
+end
+
+@inline function rstrip_here(name::String)
+  # "SHEEP-HERE" -> "SHEEP"
+  endswith(name, "-HERE") ? name[1:end-5] : name
+end
+
+function any_with_fastpath(context::Context, call::ReporterCall)
+  with_args = with_call_components(call)
+  with_args === nothing && return nothing
+  base = eval_expr(context, with_args[1])
+  base isa AgentSet || return nothing
+  block = with_args[2]::ReporterBlockNode
+  caller = block_caller(context)
+  @for_agents agent base begin
+    logical(eval_reporter_block(context, block, agent, caller)) && return true
+  end
+  false
+end
+
+@inline function of_call_components(call::ReporterCall)
+  length(call.args) == 1 || return nothing
+  arg = call.args[1]
+  arg isa ReporterCall || return nothing
+  arg.name == "OF" || return nothing
+  length(arg.args) == 2 || return nothing
+  arg.args[1] isa ReporterBlockNode || return nothing
+  arg.args
+end
+
+function sum_of_fastpath(context::Context, call::ReporterCall)
+  of_args = of_call_components(call)
+  of_args === nothing && return nothing
+  target = eval_expr(context, of_args[2])
+  target isa AgentSet || return nothing
+  block = of_args[1]::ReporterBlockNode
+  caller = block_caller(context)
+  total = 0.0
+  @for_agents agent target begin
+    value = eval_reporter_block(context, block, agent, caller)
+    is_logo_number(value) && (total += Float64(value))
+  end
+  total
+end
+
+function mean_of_fastpath(context::Context, call::ReporterCall)
+  of_args = of_call_components(call)
+  of_args === nothing && return nothing
+  target = eval_expr(context, of_args[2])
+  target isa AgentSet || return nothing
+  block = of_args[1]::ReporterBlockNode
+  caller = block_caller(context)
+  total = 0.0
+  matched = 0
+  sampled = nothing
+  @for_agents agent target begin
+    value = eval_reporter_block(context, block, agent, caller)
+    if is_logo_number(value)
+      total += Float64(value)
+      matched += 1
+    elseif matched == 0
+      sampled === nothing && (sampled = Any[])
+      push!(sampled::Vector{Any}, value)
+    end
+  end
+  matched > 0 || throw(aggregate_numeric_error("mean", sampled === nothing ? Any[] : sampled))
+  total / matched
+end
+
+@inline function count_on_components(call::ReporterCall)
+  length(call.args) == 1 || return nothing
+  arg = call.args[1]
+  arg isa ReporterCall || return nothing
+  if arg.name == "TURTLES-ON"
+    length(arg.args) == 1 || return nothing
+    return (:turtles, nothing, arg.args[1], "turtles-on")
+  elseif arg.name == "TURTLE-BREED-ON"
+    length(arg.args) == 2 || return nothing
+    arg.args[1] isa SymbolArg || return nothing
+    breed = symbol_arg_name(arg.args[1])
+    return (:turtles, breed, arg.args[2], "$(lowercase(breed))-on")
+  elseif arg.name == "PATCHES-ON"
+    length(arg.args) == 1 || return nothing
+    return (:patches, nothing, arg.args[1], "patches-on")
+  end
+  nothing
+end
+
+function count_on_fastpath(context::Context, call::ReporterCall)
+  components = count_on_components(call)
+  components === nothing && return nothing
+  kind, breed, source_arg, opname = components
+  source = eval_expr(context, source_arg)
+  if kind == :turtles
+    return Float64(count_turtles_on_sources(context.runtime.world, source; breed=breed, opname=opname))
+  end
+  Float64(length(source_patch_keys(context.runtime.world, source, opname)))
+end
+
+function one_of_with_fastpath(context::Context, call::ReporterCall)
+  with_args = with_call_components(call)
+  with_args === nothing && return nothing
+  base = eval_expr(context, with_args[1])
+  base isa AgentSet || return nothing
+  block = with_args[2]::ReporterBlockNode
+  caller = block_caller(context)
+  rng = context.runtime.world.rng
+  chosen = NOBODY
+  matched = 0
+  @for_agents agent base begin
+    logical(eval_reporter_block(context, block, agent, caller)) || continue
+    matched += 1
+    rand(rng, 1:matched) == 1 && (chosen = agent)
+  end
+  chosen
 end
 
 function all_agentset(context::Context, agentset::AgentSet, block::ReporterBlockNode)
-  for agent in agentset
-    value = eval_reporter_block(context, block; agent=agent, caller=block_caller(context))
+  caller = block_caller(context)
+  @for_agents agent agentset begin
+    value = eval_reporter_block(context, block, agent, caller)
     value isa Bool || throw(LogoRuntimeError("ALL? expected a true/false value from $(logo_string(agent)), but got $(error_logo_string(value)) instead."))
     value || return false
   end
@@ -6367,36 +7416,50 @@ function all_agentset(context::Context, agentset::AgentSet, block::ReporterBlock
 end
 
 function of_value(context::Context, block::ReporterBlockNode, target)
+  caller = block_caller(context)
   if target isa AgentSet
-    Any[eval_reporter_block(context, block; agent=agent, caller=block_caller(context)) for agent in target]
+    _members, _all_live = agentset_members_for_iteration(target)
+    result = Vector{Any}(undef, length(_members))
+    _j = 0
+    @inbounds for _i in eachindex(_members)
+      agent = _members[_i]
+      if _all_live || agent_is_live(agent)
+        _j += 1
+        result[_j] = eval_reporter_block(context, block, agent, caller)
+      end
+    end
+    resize!(result, _j)
+    return result
   elseif target isa AbstractAgent
-    eval_reporter_block(context, block; agent=target, caller=block_caller(context))
+    eval_reporter_block(context, block, target, caller)
   else
     throw(LogoRuntimeError("of expects an agent or agentset"))
   end
 end
 
-function run_block_for_agents!(context::Context, agents::Vector{AbstractAgent}, block::BlockNode; random_order::Bool=false)
-  frozen = copy(agents)
-  random_order && shuffle!(context.runtime.world.rng, frozen)
+function run_block_for_agents!(
+  context::Context,
+  agent::AbstractAgent,
+  block::BlockNode,
+  random_order::Bool)
+  direct_stmt = single_noscope_stmt(block)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(block) : nothing
   saved_agent = context.agent
   saved_caller = context.caller
   saved_in_ask = context.in_ask
+  live_agent = ensure_live_agent(context.runtime.world, agent)
   try
-    for agent in frozen
-      agent_is_live(agent) || continue
-      context.agent = agent
-      context.caller = saved_agent
-      context.in_ask = true
+    context.caller = saved_agent
+    context.in_ask = true
+    context.agent = live_agent
+    if block.may_stop
       try
-        execute_block!(context, block)
+        execute_block_fast!(context, block, direct_stmt, direct_stmts, true)
       catch signal
-        if signal isa StopSignal
-          nothing
-        else
-          rethrow()
-        end
+        signal isa StopSignal || rethrow()
       end
+    else
+      execute_block_fast!(context, block, direct_stmt, direct_stmts, true)
     end
   finally
     context.agent = saved_agent
@@ -6405,6 +7468,167 @@ function run_block_for_agents!(context::Context, agents::Vector{AbstractAgent}, 
   end
   nothing
 end
+
+run_block_for_agents!(context::Context, agent::AbstractAgent, block::BlockNode) =
+  run_block_for_agents!(context, agent, block, false)
+
+@inline function execute_small_ask_agent!(
+  context::Context,
+  agent::AbstractAgent,
+  block::BlockNode,
+  direct_stmt::Union{Nothing, CommandCall}=single_noscope_stmt(block),
+  direct_stmts::Union{Nothing, Vector{AbstractStmt}}=(direct_stmt === nothing ? noscope_statements(block) : nothing))
+  agent_is_live(agent) || return nothing
+  context.agent = agent
+  if block.may_stop
+    try
+      execute_block_fast!(context, block, direct_stmt, direct_stmts, true)
+    catch signal
+      signal isa StopSignal || rethrow()
+    end
+  else
+    execute_block_fast!(context, block, direct_stmt, direct_stmts, true)
+  end
+  nothing
+end
+
+function run_block_for_agents!(
+  context::Context,
+  agents::AbstractVector{<:AbstractAgent},
+  block::BlockNode,
+  random_order::Bool)
+  direct_stmt = single_noscope_stmt(block)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(block) : nothing
+  saved_agent = context.agent
+  saved_caller = context.caller
+  saved_in_ask = context.in_ask
+  count = length(agents)
+  if count == 0
+    return nothing
+  elseif count == 1
+    single = agents[1]
+    agent_is_live(single) || return nothing
+    return run_block_for_agents!(context, single, block, random_order)
+  end
+  iter_agents = agents
+  used_buffer = false
+  try
+    context.caller = saved_agent
+    context.in_ask = true
+    if random_order && count == 2
+      first = agents[1]
+      second = agents[2]
+      if rand(context.runtime.world.rng, Bool)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+      else
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+      end
+    elseif random_order && count == 3
+      first = agents[1]
+      second = agents[2]
+      third = agents[3]
+      order = rand(context.runtime.world.rng, 1:6)
+      if order == 1
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+      elseif order == 2
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+      elseif order == 3
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+      elseif order == 4
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+      elseif order == 5
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+      else
+        execute_small_ask_agent!(context, third, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, second, block, direct_stmt, direct_stmts)
+        execute_small_ask_agent!(context, first, block, direct_stmt, direct_stmts)
+      end
+    else
+      if random_order
+        shuffled = acquire_agent_iteration_buffer!(context.runtime, agents)
+        shuffle!(context.runtime.world.rng, shuffled)
+        iter_agents = shuffled
+        used_buffer = true
+      end
+      if direct_stmt === nothing && direct_stmts === nothing
+        if block.may_stop
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            try
+              execute_block!(context, block)
+            catch signal
+              signal isa StopSignal || rethrow()
+            end
+          end
+        else
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            execute_block!(context, block)
+          end
+        end
+      elseif direct_stmt === nothing
+        if block.may_stop
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            try
+              execute_noscope_block!(context, direct_stmts::Vector{AbstractStmt})
+            catch signal
+              signal isa StopSignal || rethrow()
+            end
+          end
+        else
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            execute_noscope_block!(context, direct_stmts::Vector{AbstractStmt})
+          end
+        end
+      else
+        if block.may_stop
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            try
+              execute_stmt!(context, direct_stmt)
+            catch signal
+              signal isa StopSignal || rethrow()
+            end
+          end
+        else
+          for agent in iter_agents
+            agent_is_live(agent) || continue
+            context.agent = agent
+            execute_stmt!(context, direct_stmt)
+          end
+        end
+      end
+    end
+  finally
+    used_buffer && release_agent_iteration_buffer!(context.runtime)
+    context.agent = saved_agent
+    context.caller = saved_caller
+    context.in_ask = saved_in_ask
+  end
+  nothing
+end
+
+run_block_for_agents!(context::Context, agents::AbstractVector{<:AbstractAgent}, block::BlockNode) =
+  run_block_for_agents!(context, agents, block, false)
 
 function build_default_registry()
   registry = PrimitiveRegistry()
@@ -6515,6 +7739,9 @@ function build_default_registry()
   register_primitive!(registry, "RESET-TIMER", COMMAND, command_syntax(agent_classes="O---"), (ctx, args) -> reset_timer!(ctx.runtime.world))
   register_primitive!(registry, "WAIT", COMMAND, command_syntax(right=[NumberType]),
     (ctx, args) -> wait_seconds(args[1]))
+  # display/no-display: headless no-ops
+  register_primitive!(registry, "DISPLAY", COMMAND, command_syntax(), (ctx, args) -> nothing)
+  register_primitive!(registry, "NO-DISPLAY", COMMAND, command_syntax(), (ctx, args) -> nothing)
   register_primitive!(registry, "SHOW", COMMAND, command_syntax(right=[WildcardType]),
     function (ctx, args)
       write_command_output!(ctx.runtime, output_object_text(args[1]; owner=ctx.agent, add_newline=true, readable=true))
@@ -6817,7 +8044,7 @@ function build_default_registry()
   register_primitive!(registry, "WHILE", COMMAND,
     command_syntax(right=[BooleanBlockType, CommandBlockType], arg_modes=[:reporter_block, :block]),
     function (ctx, args)
-      while logical(eval_reporter_block(ctx, args[1]; agent=ctx.agent, caller=ctx.caller))
+      while logical(eval_reporter_block(ctx, args[1], ctx.agent, ctx.caller))
         execute_block!(ctx, args[2])
       end
       nothing
@@ -6867,13 +8094,18 @@ function build_default_registry()
   register_primitive!(registry, "ASK", COMMAND,
     command_syntax(right=[AgentType | AgentsetType, CommandBlockType], arg_modes=[:eval, :block], introduces_context=true),
     function (ctx, args)
-      run_block_for_agents!(ctx, coerce_agents(ctx.runtime.world, args[1]), args[2]; random_order=true)
+      target = args[1]
+      if target isa AbstractAgent
+        run_block_for_agents!(ctx, target, args[2], true)
+      else
+        run_block_for_agents!(ctx, coerce_agents(ctx.runtime.world, target), args[2], true)
+      end
       nothing
     end)
   register_primitive!(registry, "ASK-CONCURRENT", COMMAND,
     command_syntax(right=[AgentsetType, CommandBlockType], arg_modes=[:eval, :block], introduces_context=true),
     function (ctx, args)
-      run_block_for_agents!(ctx, require_agentset_input(ctx.runtime.world, args[1], "ASK-CONCURRENT"), args[2]; random_order=true)
+      run_block_for_agents!(ctx, require_agentset_input(ctx.runtime.world, args[1], "ASK-CONCURRENT"), args[2], true)
       nothing
     end)
 
@@ -6951,13 +8183,15 @@ function build_default_registry()
     end)
 
   register_primitive!(registry, "FD", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
-    (ctx, args) -> jump_turtle_with_pen!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
+    (ctx, args) -> move_turtle_with_pen_blocking!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
   register_primitive!(registry, "FORWARD", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
-    (ctx, args) -> jump_turtle_with_pen!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
+    (ctx, args) -> move_turtle_with_pen_blocking!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
+  register_primitive!(registry, "JUMP", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
+    (ctx, args) -> move_turtle_with_pen_blocking!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
   register_primitive!(registry, "BK", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
-    (ctx, args) -> jump_turtle_with_pen!(ctx.runtime.world, ctx.agent::Turtle, -numeric(args[1])))
+    (ctx, args) -> move_turtle_with_pen_blocking!(ctx.runtime.world, ctx.agent::Turtle, -numeric(args[1])))
   register_primitive!(registry, "BACK", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
-    (ctx, args) -> jump_turtle_with_pen!(ctx.runtime.world, ctx.agent::Turtle, -numeric(args[1])))
+    (ctx, args) -> move_turtle_with_pen_blocking!(ctx.runtime.world, ctx.agent::Turtle, -numeric(args[1])))
   register_primitive!(registry, "RT", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
     (ctx, args) -> turn_turtle!(ctx.runtime.world, ctx.agent::Turtle, numeric(args[1])))
   register_primitive!(registry, "RIGHT", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
@@ -7079,9 +8313,9 @@ function build_default_registry()
   register_primitive!(registry, "TURTLE-BREED-HERE", REPORTER, reporter_syntax(right=[SymbolType], ret=TurtlesetType, arg_modes=[:symbol], agent_classes="-TP-"),
     function (ctx, args)
       if ctx.agent isa Turtle
-        return turtles_on_patch(ctx.runtime.world, current_patch(ctx.runtime.world, ctx.agent); breed=args[1])
+        return turtles_on_patch_canonical(ctx.runtime.world, current_patch(ctx.runtime.world, ctx.agent), args[1])
       elseif ctx.agent isa Patch
-        return turtles_on_patch(ctx.runtime.world, ctx.agent; breed=args[1])
+        return turtles_on_patch_canonical(ctx.runtime.world, ctx.agent, args[1])
       end
       throw(LogoRuntimeError("$(lowercase(args[1]))-here is only available to turtles and patches"))
     end)
@@ -7103,7 +8337,17 @@ function build_default_registry()
       throw(LogoRuntimeError("$(lowercase(args[1]))-at is only available to turtles and patches"))
     end)
   register_primitive!(registry, "AT-POINTS", REPORTER, reporter_syntax(left=TurtlesetType | PatchsetType, right=[ListType], ret=AgentsetType, precedence=WithPrecedence),
-    (ctx, args) -> agents_at_points(ctx.runtime.world, args[1], args[2]))
+    (ctx, args) -> begin
+      agent = ctx.agent
+      if agent isa Turtle
+        agents_at_points(ctx.runtime.world, args[1], args[2], Float64(agent.xcor), Float64(agent.ycor))
+      elseif agent isa Patch
+        agents_at_points(ctx.runtime.world, args[1], args[2], Float64(agent.pxcor), Float64(agent.pycor))
+      else
+        # Observer context: offsets relative to origin (0, 0)
+        agents_at_points(ctx.runtime.world, args[1], args[2], 0.0, 0.0)
+      end
+    end)
   register_primitive!(registry, "TURTLES-ON", REPORTER, reporter_syntax(right=[WildcardType], ret=TurtlesetType),
     (ctx, args) -> turtles_on_sources(ctx.runtime.world, args[1]))
   register_primitive!(registry, "PATCHES-ON", REPORTER, reporter_syntax(right=[WildcardType], ret=PatchsetType),
@@ -7279,6 +8523,9 @@ function build_default_registry()
   register_primitive!(registry, "OUT-LINK-NEIGHBOR?", REPORTER,
     reporter_syntax(right=[TurtleType], ret=BooleanType, agent_classes="-T--"),
     (ctx, args) -> link_neighbor(ctx.runtime.world, ctx.agent::Turtle, args[1]; mode=:out))
+  register_primitive!(registry, "LINK-BREED-NEIGHBOR?", REPORTER,
+    reporter_syntax(right=[SymbolType, SymbolType, TurtleType], ret=BooleanType, agent_classes="-T--", arg_modes=[:symbol, :symbol, :eval]),
+    (ctx, args) -> link_neighbor(ctx.runtime.world, ctx.agent::Turtle, args[3]; breed=args[1], mode=link_mode_symbol(args[2])))
   register_primitive!(registry, "LINK-LENGTH", REPORTER,
     reporter_syntax(ret=NumberType, agent_classes="---L"),
     (ctx, args) -> link_length(ctx.runtime.world, ctx.agent::Link))
@@ -7522,7 +8769,7 @@ function build_default_registry()
   register_primitive!(registry, "RANDOM", REPORTER, reporter_syntax(right=[NumberType], ret=NumberType),
     function (ctx, args)
       limit = Int(floor(numeric(args[1])))
-      limit > 0 || throw(LogoRuntimeError("random expects a positive upper bound"))
+      limit <= 0 && return 0.0
       Float64(rand(ctx.runtime.world.rng, 0:limit - 1))
     end)
   register_primitive!(registry, "RANDOM-FLOAT", REPORTER, reporter_syntax(right=[NumberType], ret=NumberType),
