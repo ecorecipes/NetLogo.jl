@@ -19,6 +19,7 @@ makedocs(
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting-started.md",
+        "GUI Backends" => "gui.md",
         "Language and Runtime" => "language.md",
         "Extensions" => "extensions.md",
         "Evaluation and Benchmarking" => "evaluation.md",

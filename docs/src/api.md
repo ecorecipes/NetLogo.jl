@@ -15,6 +15,15 @@ NetLogo.@netlogo_str
 ```@docs
 NetLogo.create_runtime
 NetLogo.call!
+NetLogo.gui_session
+NetLogo.gui_state
+NetLogo.set_gui_widget!
+NetLogo.press_gui_button!
+NetLogo.start_web_gui
+NetLogo.stop_web_gui!
+NetLogo.web_gui_url
+NetLogo.notebook_gui
+NetLogo.pluto_gui
 NetLogo.parse_turtle_shapes_text
 NetLogo.load_turtle_shapes!
 ```
@@ -43,6 +52,9 @@ NetLogo.CompiledModel
 ```@docs
 NetLogo.RuntimeState
 NetLogo.Context
+NetLogo.GUISession
+NetLogo.WebGUIBackend
+NetLogo.NotebookGUI
 NetLogo.LogoRuntimeError
 NetLogo.Observer
 NetLogo.Turtle
@@ -83,6 +95,9 @@ NetLogo.BoxTopology
 | --- | --- |
 | [`RuntimeState`](@ref) | Live executable runtime |
 | [`Context`](@ref) | Current execution context |
+| [`GUISession`](@ref) | Thread-safe host-side GUI wrapper around a runtime |
+| [`WebGUIBackend`](@ref) | Running local HTTP GUI server |
+| [`NotebookGUI`](@ref) | Notebook/Pluto iframe wrapper for the local GUI |
 | [`LogoRuntimeError`](@ref) | Runtime error type |
 | [`Observer`](@ref) | Observer agent record |
 | [`Turtle`](@ref) | Turtle agent record |

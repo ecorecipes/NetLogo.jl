@@ -8,12 +8,13 @@
 - loading `.nlogo` models and resolving `__includes`
 - headless execution for observers, turtles, patches, and links
 - import/export, plotting, drawing, and file I/O needed by headless models
+- host-side GUI sessions for browsers and notebooks
 - extension loading and built-in extension implementations
 - evaluation tooling for Julia-vs-Java NetLogo comparability
 
 ## What remains out of scope
 
-- the NetLogo desktop GUI
+- the full NetLogo desktop application workflow
 - HubNet
 - 3D world semantics
 
@@ -27,6 +28,7 @@
 ## Documentation map
 
 - **Getting Started**: install the package locally and run a first model.
+- **GUI Backends**: serve interface widgets and plots through a local browser UI or notebook embed.
 - **Language and Runtime**: understand the parser, compiled model, runtime, and compatibility scope.
 - **Extensions**: see the bundled extension surface and the extension-loading mechanism.
 - **Evaluation and Benchmarking**: run the comparison harness against Java NetLogo.

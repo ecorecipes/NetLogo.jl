@@ -97,12 +97,46 @@ const MODELS = Dict(
     "evolutionofnorms"  => EvolutionOfNormsModel(),
     "lassavirus"        => LassaVirusModel(),
     "axelrodcultural"   => AxelrodCulturalModel(),
+    "mousetraps"        => MousetrapsModel(),
+    "firebenchmark"     => FireBenchmarkModel(),
+    # Modeling Commons classic models
+    "dlasimple"         => DLASimpleModel(),
+    "boiling"           => BoilingModel(),
+    "soliddiffusion"    => SolidDiffusionModel(),
+    "flocking"          => FlockingModel(),
+    "sand"              => SandModel(),
+    "rope"              => RopeModel(),
+    "polymer"           => PolymerDynamicsModel(),
+    "thermostat"        => ThermostatModel(),
+    "crystallization"   => CrystallizationModel(),
+    "mimicry"           => MimicryModel(),
+    # NW extension eval wrappers (modelingcommons)
+    "superdiffuser"     => SuperDiffuserModel(),
+    "druguse"           => DrugUseModel(),
+    "productsmarket"    => ProductsModel(),
+    "socialinfluence"   => SocialInfluenceModel(),
+    "participdisinfo"   => ParticipatoryDisinformationModel(),
+    "infodiffusion"     => InfoDiffusionModel(),
+    "recruitingsupporters" => RecruitingSupportersModel(),
+    "gishillclimber"    => GisHillClimberModel(),
+    "rhinopoaching"     => RhinoPoachingModel(),
+    # Additional NW extension models
+    "minoritybelief"    => MinorityBeliefModel(),
+    "slowspread"        => SlowSpreadModel(),
+    "spreadinggroups"   => SpreadingGroupsModel(),
+    "recruiting"        => RecruitingModel(),
+    # Modeling Commons additional NW models
+    "fakenews"          => FakeNewsModel(),
 )
 
 # Models too slow for batch comparison runs (>30s/run)
 const SLOW_MODELS = Set(["elfarol", "birthrates", "antsystem", "coin", "contactprocess", "tourism", "langborders",
-                         "bombscenario", "multidrugresistant", "hikingelevation", "diffusionofhiv", "sleuthlanduse", "riseofradicalism",
-                         "searchpath", "voronoivoter", "artificialeconomy", "infinitelife"])
+                          "bombscenario", "multidrugresistant", "hikingelevation", "diffusionofhiv", "sleuthlanduse", "riseofradicalism",
+                          "searchpath", "voronoivoter", "artificialeconomy", "infinitelife",
+                          "lassavirus", "axelrodcultural",
+                          "rationalevolvpd", "cyberopinion", "rhinopoaching",
+                          "contagionsi", "contagionsir", "coord2groups", "opinionbc",
+                          "civgrowth", "productsmarket", "participdisinfo"])
 
 function julia_only_smoke_test()
     println("═══════════════════════════════════════════════════")

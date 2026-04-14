@@ -70,12 +70,18 @@ const MODELS = Dict(
     "civgrowth"      => CivilizationGrowthModel(),
     "unitcohesion"   => UnitCohesionModel(),
     "dating"         => DatingModel(),
+    # Modeling Commons eval candidates
+    "mousetraps"     => MousetrapsModel(),
+    "firebenchmark"  => FireBenchmarkModel(),
+    "lassavirus"     => LassaVirusModel(),
+    "axelrodcultural" => AxelrodCulturalModel(),
 )
 
 # Models too slow for full benchmarking — skip unless explicitly named
 const SLOW_MODELS = Set(["elfarol", "birthrates", "antsystem", "coin",
                          "contactprocess", "grassbrushtrees", "ipd", "voter",
-                         "firepercolation"])
+                         "firepercolation", "mousetraps", "firebenchmark",
+                         "lassavirus", "axelrodcultural"])
 
 # Representative fast models for benchmarking
 const BENCH_MODELS = ["sir", "schelling", "ants", "fire", "wolfsheep",
@@ -93,19 +99,22 @@ function benchmark_julia_single(model::AbstractBenchmarkModel, seed::Int)
 
     code = netlogo_code(model)
     min_px, max_px, min_py, max_py = world_dims(model)
+    topology_mode = NetLogoCompare.runtime_topology_mode(NetLogo, model)
     compiled = Base.invokelatest(compile_fn, code)
 
     # Warmup (compile paths)
     rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
                     min_pxcor=min_px, max_pxcor=max_px,
-                    min_pycor=min_py, max_pycor=max_py)
+                    min_pycor=min_py, max_pycor=max_py,
+                    topology=topology_mode)
     Base.invokelatest(call_fn, rt, "setup")
     Base.invokelatest(call_fn, rt, "go")
 
     # Timed run
     rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
                     min_pxcor=min_px, max_pxcor=max_px,
-                    min_pycor=min_py, max_pycor=max_py)
+                    min_pycor=min_py, max_pycor=max_py,
+                    topology=topology_mode)
 
     # Measure setup
     t_setup = @elapsed Base.invokelatest(call_fn, rt, "setup")
@@ -120,7 +129,8 @@ function benchmark_julia_single(model::AbstractBenchmarkModel, seed::Int)
     # Timed full run (separate measurement)
     rt2 = Base.invokelatest(runtime_fn, compiled; seed=seed,
                      min_pxcor=min_px, max_pxcor=max_px,
-                     min_pycor=min_py, max_pycor=max_py)
+                     min_pycor=min_py, max_pycor=max_py,
+                     topology=topology_mode)
     Base.invokelatest(call_fn, rt2, "setup")
     t_go = @elapsed begin
         for _ in 1:n_ticks(model)
@@ -207,12 +217,14 @@ function profile_model(model::AbstractBenchmarkModel; seed::Int=1)
 
     code = netlogo_code(model)
     min_px, max_px, min_py, max_py = world_dims(model)
+    topology_mode = NetLogoCompare.runtime_topology_mode(NetLogo, model)
     compiled = Base.invokelatest(compile_fn, code)
 
     # Warmup
     rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
                     min_pxcor=min_px, max_pxcor=max_px,
-                    min_pycor=min_py, max_pycor=max_py)
+                    min_pycor=min_py, max_pycor=max_py,
+                    topology=topology_mode)
     Base.invokelatest(call_fn, rt, "setup")
     for _ in 1:min(5, n_ticks(model))
         Base.invokelatest(call_fn, rt, "go")
@@ -221,7 +233,8 @@ function profile_model(model::AbstractBenchmarkModel; seed::Int=1)
     # Profile run
     rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
                     min_pxcor=min_px, max_pxcor=max_px,
-                    min_pycor=min_py, max_pycor=max_py)
+                    min_pycor=min_py, max_pycor=max_py,
+                    topology=topology_mode)
     Base.invokelatest(call_fn, rt, "setup")
 
     Profile.clear()
@@ -242,7 +255,8 @@ function profile_model(model::AbstractBenchmarkModel; seed::Int=1)
     println("="^60)
     rt2 = Base.invokelatest(runtime_fn, compiled; seed=seed,
                      min_pxcor=min_px, max_pxcor=max_px,
-                     min_pycor=min_py, max_pycor=max_py)
+                     min_pycor=min_py, max_pycor=max_py,
+                     topology=topology_mode)
     Base.invokelatest(call_fn, rt2, "setup")
     alloc_1 = @allocated Base.invokelatest(call_fn, rt2, "go")
     @printf("  Single tick: %s\n", format_bytes(alloc_1))

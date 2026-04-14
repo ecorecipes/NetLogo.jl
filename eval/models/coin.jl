@@ -9,104 +9,133 @@ tracked_globals(::CoinModel) = ["current-utility"]
 
 function netlogo_code(::CoinModel)
 """
-globals [actions attendance randomSeed num-agents num-nights discount-rate reward-function current-utility]
+globals [
+  randomSeed
+  num-agents
+  discount-rate
+  current-utility
+  attendance0 attendance1 attendance2 attendance3 attendance4 attendance5 attendance6
+  reward0 reward1 reward2 reward3 reward4 reward5 reward6
+]
 
 breed [players player]
-players-own [utility-vector last-action]
+players-own [u0 u1 u2 u3 u4 u5 u6 last-action-idx]
 
-to-report add-vectors [v1 v2]
-  report (map [[a b] -> a + b] v1 v2)
+to-report day-utility [x]
+  report x * exp ((0 - x) / 3)
 end
 
-to-report subtract-vectors [v1 v2]
-  report (map [[a b] -> a - b] v1 v2)
+to-report global-utility-from-counts [a0 a1 a2 a3 a4 a5 a6]
+  report (day-utility a0) + (day-utility a1) + (day-utility a2) +
+         (day-utility a3) + (day-utility a4) + (day-utility a5) + (day-utility a6)
 end
 
-to-report global-utility [att]
-  report sum (map [[x] -> x * exp ((0 - x) / (item (num-nights - 1) (list 3 6 8 10 12 15)))] att)
+to recompute-attendance
+  set attendance0 0
+  set attendance1 0
+  set attendance2 0
+  set attendance3 0
+  set attendance4 0
+  set attendance5 0
+  set attendance6 0
+  ask players [
+    if last-action-idx = 0 [ set attendance0 attendance0 + 1 ]
+    if last-action-idx = 1 [ set attendance1 attendance1 + 1 ]
+    if last-action-idx = 2 [ set attendance2 attendance2 + 1 ]
+    if last-action-idx = 3 [ set attendance3 attendance3 + 1 ]
+    if last-action-idx = 4 [ set attendance4 attendance4 + 1 ]
+    if last-action-idx = 5 [ set attendance5 attendance5 + 1 ]
+    if last-action-idx = 6 [ set attendance6 attendance6 + 1 ]
+  ]
+end
+
+to recompute-rewards
+  set current-utility global-utility-from-counts attendance0 attendance1 attendance2 attendance3 attendance4 attendance5 attendance6
+  set reward0 1 + current-utility - global-utility-from-counts (attendance0 - 1 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward1 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 - 1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward2 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 - 1 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward3 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 - 1 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward4 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 - 1 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward5 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 - 1 + (1 / 7)) (attendance6 + (1 / 7))
+  set reward6 1 + current-utility - global-utility-from-counts (attendance0 + (1 / 7)) (attendance1 + (1 / 7)) (attendance2 + (1 / 7)) (attendance3 + (1 / 7)) (attendance4 + (1 / 7)) (attendance5 + (1 / 7)) (attendance6 - 1 + (1 / 7))
+end
+
+to-report stochastic-choice-7 [w0 w1 w2 w3 w4 w5 w6]
+  let total (w0 + w1 + w2 + w3 + w4 + w5 + w6)
+  let r random-float total
+  if r <= w0 [ report 0 ]
+  set r r - w0
+  if r <= w1 [ report 1 ]
+  set r r - w1
+  if r <= w2 [ report 2 ]
+  set r r - w2
+  if r <= w3 [ report 3 ]
+  set r r - w3
+  if r <= w4 [ report 4 ]
+  set r r - w4
+  if r <= w5 [ report 5 ]
+  report 6
 end
 
 to setup
   clear-all
   set num-agents 63
-  set num-nights 1
   set discount-rate 0.98
-  set reward-function "aristocratic"
   set current-utility 0
   create-players num-agents [
     hide-turtle
     setxy 0 who
-    set utility-vector n-values 7 [100]
-  ]
-  set actions []
-  foreach n-values 7 [i -> i] [sd ->
-    let start-day sd
-    let action n-values 7 [0]
-    repeat num-nights [
-      set action replace-item start-day action 1
-      set start-day (start-day + 1) mod 7
-    ]
-    set actions lput action actions
+    set u0 100
+    set u1 100
+    set u2 100
+    set u3 100
+    set u4 100
+    set u5 100
+    set u6 100
+    set last-action-idx 0
   ]
   repeat 100 [
     ask players [take-random-action]
-    set attendance reduce [[a b] -> add-vectors a b] [last-action] of players
+    recompute-attendance
+    recompute-rewards
     ask players [learn]
   ]
-  set current-utility global-utility attendance
+  recompute-attendance
+  set current-utility global-utility-from-counts attendance0 attendance1 attendance2 attendance3 attendance4 attendance5 attendance6
   reset-ticks
 end
 
 to go
   ask players [take-action]
-  set attendance reduce [[a b] -> add-vectors a b] [last-action] of players
+  recompute-attendance
+  recompute-rewards
   ask players [learn]
-  set current-utility global-utility attendance
   tick
 end
 
-to-report stochastic-choice [v]
-  let r random-float sum v
-  let idx 0
-  let base-prob 0
-  repeat length v [
-    set base-prob base-prob + (item idx v)
-    if (r <= base-prob) [ report idx ]
-    set idx idx + 1
-  ]
-  report 0
-end
-
-to-report boltzmann-choice [v]
-  report stochastic-choice (map [[x] -> exp (x / 3)] v)
-end
-
 to take-action
-  set last-action item (stochastic-choice utility-vector) actions
+  set last-action-idx stochastic-choice-7 u0 u1 u2 u3 u4 u5 u6
 end
 
 to take-random-action
-  set last-action item (random length actions) actions
-end
-
-to-report get-reward
-  if (reward-function = "wonderful-life-0") [
-    report 1 + (global-utility attendance) - (global-utility (subtract-vectors attendance last-action))
-  ]
-  if (reward-function = "wonderful-life-1") [
-    report 1 + (global-utility attendance) - global-utility (add-vectors (subtract-vectors attendance last-action) (list 1 1 1 1 1 1 1))
-  ]
-  if (reward-function = "aristocratic") [
-    report 1 + (global-utility attendance) - global-utility (add-vectors (subtract-vectors attendance last-action) n-values 7 [1 / 7])
-  ]
-  report 0
+  set last-action-idx random 7
 end
 
 to learn
-  set utility-vector (map [[x] -> x * discount-rate] utility-vector)
-  let idx position last-action actions
-  let reward get-reward
-  set utility-vector replace-item idx utility-vector ((item idx utility-vector) + reward)
+  set u0 u0 * discount-rate
+  set u1 u1 * discount-rate
+  set u2 u2 * discount-rate
+  set u3 u3 * discount-rate
+  set u4 u4 * discount-rate
+  set u5 u5 * discount-rate
+  set u6 u6 * discount-rate
+  if last-action-idx = 0 [ set u0 u0 + reward0 ]
+  if last-action-idx = 1 [ set u1 u1 + reward1 ]
+  if last-action-idx = 2 [ set u2 u2 + reward2 ]
+  if last-action-idx = 3 [ set u3 u3 + reward3 ]
+  if last-action-idx = 4 [ set u4 u4 + reward4 ]
+  if last-action-idx = 5 [ set u5 u5 + reward5 ]
+  if last-action-idx = 6 [ set u6 u6 + reward6 ]
 end
 """
 end

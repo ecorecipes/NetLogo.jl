@@ -1,6 +1,24 @@
 using Test
 using NetLogo
 
+# Define a tiny test extension for the "extensions support" testset below
+module Testext
+  using NetLogo: PrimitiveRegistry, register_primitive!, COMMAND, REPORTER,
+                 command_syntax, reporter_syntax, NumberType
+
+  function register_primitives!(registry::PrimitiveRegistry)
+      register_primitive!(registry, "TESTEXT:STORE", COMMAND,
+          command_syntax(right=[NumberType]),
+          (ctx, args) -> begin
+              ctx.runtime.world.observer.globals["EXTENSION-VALUE"] = args[1]
+              nothing
+          end)
+      register_primitive!(registry, "TESTEXT:DOUBLE", REPORTER,
+          reporter_syntax(right=[NumberType], ret=NumberType),
+          (ctx, args) -> Float64(args[1]) * 2.0)
+  end
+end
+
 @testset "integration: basic runtime execution" begin
   runtime = create_runtime(netlogo"""
   globals [steps]
@@ -3008,7 +3026,7 @@ end
     set offspring-whos sort [who] of turtles
     set aimed-heading [heading] of turtle 0
     set hatch-energy [mice-energy] of turtle 2
-    set moved-frog [list xcor ycor frog-energy shape] of turtle 3
+    set moved-frog [(list xcor ycor frog-energy shape)] of turtle 3
     set sprout-count count frogs with [xcor = -2 and ycor = 1]
     set dead-ref nobody
   end
@@ -3053,7 +3071,7 @@ end
 
   to-report probe-under [wrap-x? wrap-y? third-distance]
     setup-topology wrap-x? wrap-y?
-    report [list can-move? 1 can-move? 0.5 can-move? third-distance] of turtle 0
+    report [(list can-move? 1 can-move? 0.5 can-move? third-distance)] of turtle 0
   end
   """; min_pxcor=-5, max_pxcor=5, min_pycor=-5, max_pycor=5, topology=Torus, seed=229)
 
@@ -3061,6 +3079,33 @@ end
   @test call!(runtime, "probe-under", false, true, 0.2) == Any[true, true, true]
   @test call!(runtime, "probe-under", true, false, 0.2) == Any[false, false, true]
   @test call!(runtime, "probe-under", false, false, 0.2) == Any[false, false, true]
+  @test call!(runtime, "probe-under", false, false, 0.4) == Any[false, false, false]
+end
+
+@testset "integration: blocked forward movement" begin
+  runtime = create_runtime(netlogo"""
+  to setup
+    clear-all
+    resize-world 0 2 0 2
+    set-topology false false
+    crt 1 [ setxy 1 1 set heading 90 ]
+  end
+
+  to-report partial-forward [distance]
+    setup
+    ask turtle 0 [ fd distance ]
+    report [list xcor ycor] of turtle 0
+  end
+
+  to-report blocked-forward-at-edge [distance]
+    setup
+    ask turtle 0 [ setxy 2 1 fd distance ]
+    report [list xcor ycor] of turtle 0
+  end
+  """; seed=230)
+
+  @test call!(runtime, "partial-forward", 2) == Any[2.0, 1.0]
+  @test call!(runtime, "blocked-forward-at-edge", 1) == Any[2.0, 1.0]
 end
 
 @testset "integration: uphill and downhill compatibility" begin
@@ -3474,7 +3519,7 @@ end
   end
 
   to-report default-missing
-    report word link 2 3
+    report (word link 2 3)
   end
 
   to-report road-color
@@ -4634,8 +4679,8 @@ end
     __apply [ crt 1 ] []
     set apply-command-empty count turtles
     clear-turtles
-    set symbol-values list (__symbol what-is-this) (__symbol xcor) (__symbol turtles) (__symbol turtle)
-    set block-values list (__block [ crt some-stuff ]) (__block [ crt [ setxy foo bar ] ]) (__block [ [foo] -> foo ])
+    set symbol-values (list (__symbol what-is-this) (__symbol xcor) (__symbol turtles) (__symbol turtle))
+    set block-values (list (__block [ crt some-stuff ]) (__block [ crt [ setxy foo bar ] ]) (__block [ [foo] -> foo ]))
     set arity-one ""
     set arity-two ""
     set command-arity-one ""
@@ -4853,6 +4898,44 @@ end
   @test call!(runtime, "foreach-early-exit") == "oranges"
 end
 
+@testset "integration: ask stop handling" begin
+  runtime = create_runtime(netlogo"""
+  turtles-own [hits]
+  globals [direct-stop-hits run-stop-hits]
+
+  to setup
+    clear-all
+    create-turtles 3 [ set hits 0 ]
+  end
+
+  to direct-stop-ask
+    ask turtles [
+      set hits hits + 1
+      stop
+      set hits hits + 10
+    ]
+    set direct-stop-hits sort [hits] of turtles
+  end
+
+  to run-stop-ask
+    ask turtles [
+      set hits 0
+      set hits hits + 1
+      run [ -> stop ]
+      set hits hits + 10
+    ]
+    set run-stop-hits sort [hits] of turtles
+  end
+  """; seed=287)
+
+  call!(runtime, "setup")
+  call!(runtime, "direct-stop-ask")
+  call!(runtime, "run-stop-ask")
+
+  @test runtime.world.observer.globals["DIRECT-STOP-HITS"] == Any[1.0, 1.0, 1.0]
+  @test runtime.world.observer.globals["RUN-STOP-HITS"] == Any[1.0, 1.0, 1.0]
+end
+
 @testset "integration: foreach concise command references" begin
   runtime = create_runtime(netlogo"""
   globals [procedure-total turtle-count extra-input-count forward-y remaining-turtles]
@@ -5019,6 +5102,51 @@ end
   @test runtime.world.observer.globals["ENCODED"] == "1,2,3\n4,5,6\n7,8,9"
   decoded = runtime.world.observer.globals["DECODED"]
   @test decoded == Any[Any[1.0, 2.0, 3.0], Any[4.0, 5.0, 6.0], Any[7.0, 8.0, 9.0]]
+end
+
+# ── csv file I/O integration ───────────────────────────────────────────
+@testset "integration: csv file I/O" begin
+  tmpdir = mktempdir()
+  inpath = joinpath(tmpdir, "input.csv")
+  outpath = joinpath(tmpdir, "output.csv")
+  write(inpath, "name,age,active\nAlice,30,true\nBob,25,false\n\"Eve, Jr\",22,true")
+
+  runtime = create_runtime(compile_model("""
+  extensions [csv]
+  globals [loaded saved roundtrip-ok semicol-data]
+
+  to setup
+    set loaded csv:from-file "$inpath"
+    csv:to-file "$outpath" loaded
+    set saved csv:from-file "$outpath"
+    set roundtrip-ok (loaded = saved)
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  loaded = runtime.world.observer.globals["LOADED"]
+  @test loaded == Any[
+    Any["name", "age", "active"],
+    Any["Alice", 30.0, true],
+    Any["Bob", 25.0, false],
+    Any["Eve, Jr", 22.0, true]
+  ]
+  @test runtime.world.observer.globals["ROUNDTRIP-OK"] == true
+
+  # Test delimiter variant
+  semipath = joinpath(tmpdir, "semi.csv")
+  write(semipath, "a;b;c\n1;2;3")
+  rt2 = create_runtime(compile_model("""
+  extensions [csv]
+  globals [result]
+  to setup
+    set result csv:from-file-with-delimiter "$semipath" ";"
+  end
+  """); seed=1)
+  call!(rt2, "setup")
+  @test rt2.world.observer.globals["RESULT"] == Any[Any["a", "b", "c"], Any[1.0, 2.0, 3.0]]
+
+  rm(tmpdir; recursive=true)
 end
 
 # ── table extension integration ────────────────────────────────────────

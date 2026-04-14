@@ -23,7 +23,6 @@ breed [greedy-cows greedy-cow]
 
 to setup
   clear-all
-  random-seed randomSeed
   resize-world (- 10) 10 (- 10) 10
   set initial-cows 20
   set cooperative-probability 0.5
@@ -46,7 +45,7 @@ to setup
 end
 
 to setup-cows
-  set-default-shape turtles "cow"
+  set-default-shape turtles "default"
   crt initial-cows [
     setxy random-xcor random-ycor
     set energy metabolism * 4

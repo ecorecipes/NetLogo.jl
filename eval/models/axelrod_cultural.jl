@@ -4,12 +4,14 @@
 # Modifications:
 #   - Added F, q, radius, world-size to globals (originally InputBox/Slider widgets)
 #   - Defaults: F=3, q=5, radius=1, world-size=10 (set in setup)
-#   - Removed resize-world (incompatible with NetLogo.jl: requires min < 0)
+#   - Removed resize-world and fixed the harness world to the source model's
+#     0..9 by 0..9 box topology
 #   - Removed set-patch-size (display-only, not needed)
 #   - Removed do-plots calls (plot procedures not needed for harness)
 #   - Removed clear-all-plots (not available headlessly)
-#   - Rewrote overlap_between using indexed loop (multi-list foreach lambda
-#     [[a b] -> ...] is not supported by the NetLogo.jl parser)
+#   - Removed display-only color refreshes from the headless eval wrapper
+#   - Replaced the turtle-based state with an equivalent patch-based wrapper
+#     because this eval configuration has exactly one stationary agent per patch
 #   - Used count patches for number_of_agents instead of world-size^2
 
 struct AxelrodCulturalModel <: AbstractBenchmarkModel end
@@ -17,7 +19,8 @@ struct AxelrodCulturalModel <: AbstractBenchmarkModel end
 model_name(::AxelrodCulturalModel) = "AxelrodCultural"
 n_ticks(::AxelrodCulturalModel) = 200
 tracked_globals(::AxelrodCulturalModel) = ["number_of_cultures", "number_of_active_agents"]
-world_dims(::AxelrodCulturalModel) = (-4, 5, -4, 5)
+world_dims(::AxelrodCulturalModel) = (0, 9, 0, 9)
+topology(::AxelrodCulturalModel) = (false, false)
 
 function netlogo_code(::AxelrodCulturalModel)
 """
@@ -31,14 +34,13 @@ globals [
   cult_max
   number_of_active_agents
   number_of_cultures
-  number_of_cultural_regions
-  component-size
-  giant-component-size
 ]
 
-turtles-own [
-  culture
-  explored?
+patches-own [
+  trait0
+  trait1
+  trait2
+  culture-id
 ]
 
 to setup
@@ -47,150 +49,148 @@ to setup
   set q 5
   set radius 1
   set world-size 10
-  ask patches [set pcolor 34]
+  ask patches [
+    set pcolor 34
+    set trait0 random q
+    set trait1 random q
+    set trait2 random q
+    set culture-id ((trait0 * q * q) + (trait1 * q) + trait2)
+  ]
   set number_of_agents count patches
-  set giant-component-size 0
-  set number_of_cultural_regions 0
-  setup-turtles
+  setup-culture-max
+  count-cultures
   reset-ticks
   set time 0
-end
-
-to setup-turtles
-  set-default-shape turtles "person"
-  create-turtles number_of_agents [
-    set size 0.9
-    while [any? other turtles-here] [ move-to one-of patches ]
-  ]
-  setup-culture-max
-  setup-agent-culture
-  count-cultures
 end
 
 to setup-culture-max
   set cult_max (q ^ F - 1)
 end
 
-to setup-agent-culture
-  ask turtles [
-    set culture []
-    repeat F [
-      set culture lput random q culture
-    ]
-    setup-agent-culture-color
-  ]
-end
-
-to setup-agent-culture-color
-  let i 1
-  let suma 0
-  repeat F [
-    set suma suma + item (i - 1) culture * q ^ (F - i)
-    set i i + 1
-  ]
-  let Cult_base_q suma
-  set color (9.9 * Cult_base_q / Cult_max) + 100
-end
-
 to go
-  clear-links
-  ask turtles [setup-agent-culture-color]
   tick
   set time time + 1
   set number_of_active_agents 0
-  ask turtles [cultural-interaction]
+  ask patches [
+    let chosen_overlap 0
+    let active_count 0
+    let chosen_neighbor_trait0 0
+    let chosen_neighbor_trait1 0
+    let chosen_neighbor_trait2 0
+
+    let north patch-at 0 1
+    if north != nobody [
+      let north_trait0 [trait0] of north
+      let north_trait1 [trait1] of north
+      let north_trait2 [trait2] of north
+      let overlap 0
+      if trait0 = north_trait0 [ set overlap overlap + 1 ]
+      if trait1 = north_trait1 [ set overlap overlap + 1 ]
+      if trait2 = north_trait2 [ set overlap overlap + 1 ]
+      if (0 < overlap) and (overlap < F) [
+        set active_count active_count + 1
+        if random active_count = 0 [
+          set chosen_overlap overlap
+          set chosen_neighbor_trait0 north_trait0
+          set chosen_neighbor_trait1 north_trait1
+          set chosen_neighbor_trait2 north_trait2
+        ]
+      ]
+    ]
+
+    let east patch-at 1 0
+    if east != nobody [
+      let east_trait0 [trait0] of east
+      let east_trait1 [trait1] of east
+      let east_trait2 [trait2] of east
+      let overlap 0
+      if trait0 = east_trait0 [ set overlap overlap + 1 ]
+      if trait1 = east_trait1 [ set overlap overlap + 1 ]
+      if trait2 = east_trait2 [ set overlap overlap + 1 ]
+      if (0 < overlap) and (overlap < F) [
+        set active_count active_count + 1
+        if random active_count = 0 [
+          set chosen_overlap overlap
+          set chosen_neighbor_trait0 east_trait0
+          set chosen_neighbor_trait1 east_trait1
+          set chosen_neighbor_trait2 east_trait2
+        ]
+      ]
+    ]
+
+    let south patch-at 0 -1
+    if south != nobody [
+      let south_trait0 [trait0] of south
+      let south_trait1 [trait1] of south
+      let south_trait2 [trait2] of south
+      let overlap 0
+      if trait0 = south_trait0 [ set overlap overlap + 1 ]
+      if trait1 = south_trait1 [ set overlap overlap + 1 ]
+      if trait2 = south_trait2 [ set overlap overlap + 1 ]
+      if (0 < overlap) and (overlap < F) [
+        set active_count active_count + 1
+        if random active_count = 0 [
+          set chosen_overlap overlap
+          set chosen_neighbor_trait0 south_trait0
+          set chosen_neighbor_trait1 south_trait1
+          set chosen_neighbor_trait2 south_trait2
+        ]
+      ]
+    ]
+
+    let west patch-at -1 0
+    if west != nobody [
+      let west_trait0 [trait0] of west
+      let west_trait1 [trait1] of west
+      let west_trait2 [trait2] of west
+      let overlap 0
+      if trait0 = west_trait0 [ set overlap overlap + 1 ]
+      if trait1 = west_trait1 [ set overlap overlap + 1 ]
+      if trait2 = west_trait2 [ set overlap overlap + 1 ]
+      if (0 < overlap) and (overlap < F) [
+        set active_count active_count + 1
+        if random active_count = 0 [
+          set chosen_overlap overlap
+          set chosen_neighbor_trait0 west_trait0
+          set chosen_neighbor_trait1 west_trait1
+          set chosen_neighbor_trait2 west_trait2
+        ]
+      ]
+    ]
+
+    if active_count > 0 [
+      set number_of_active_agents number_of_active_agents + 1
+      if random-float 1.0 < (chosen_overlap / F) [
+        let chosen_trait -1
+        let differing_count 0
+        if trait0 != chosen_neighbor_trait0 [
+          set differing_count differing_count + 1
+          if random differing_count = 0 [ set chosen_trait 0 ]
+        ]
+        if trait1 != chosen_neighbor_trait1 [
+          set differing_count differing_count + 1
+          if random differing_count = 0 [ set chosen_trait 1 ]
+        ]
+        if trait2 != chosen_neighbor_trait2 [
+          set differing_count differing_count + 1
+          if random differing_count = 0 [ set chosen_trait 2 ]
+        ]
+        if chosen_trait = 0 [ set trait0 chosen_neighbor_trait0 ]
+        if chosen_trait = 1 [ set trait1 chosen_neighbor_trait1 ]
+        if chosen_trait = 2 [ set trait2 chosen_neighbor_trait2 ]
+        if chosen_trait >= 0 [
+          set culture-id ((trait0 * q * q) + (trait1 * q) + trait2)
+        ]
+      ]
+    ]
+  ]
   count-cultures
   if number_of_active_agents = 0 [stop]
 end
 
-to cultural-interaction
-  let number_of_possible_neighbors count other turtles in-radius radius with [(0 < overlap_between self myself) and (overlap_between self myself < F)]
-  if number_of_possible_neighbors > 0 [
-    set number_of_active_agents number_of_active_agents + 1
-    let neighbor_turtle one-of other turtles in-radius radius
-    let target_turtle self
-    culturally_interacting target_turtle neighbor_turtle
-  ]
-end
-
-to-report overlap_between [target_turtle neighbor_turtle]
-  let suma 0
-  let tc [culture] of target_turtle
-  let nc [culture] of neighbor_turtle
-  let i 0
-  repeat F [
-    if item i tc = item i nc [ set suma suma + 1 ]
-    set i i + 1
-  ]
-  report suma
-end
-
-to culturally_interacting [target_turtle neighbor_turtle]
-  let overlap overlap_between target_turtle neighbor_turtle
-  if (0 < overlap and overlap < F) [
-    let prob_interaction (overlap / F)
-    if random-float 1.0 < prob_interaction [
-      let trait random F
-      let trait_selected? false
-      while [not trait_selected?] [
-        ifelse (item trait [culture] of target_turtle = item trait [culture] of neighbor_turtle)
-        [
-          set trait ((trait + 1) mod F)
-        ]
-        [
-          set trait_selected? true
-        ]
-      ]
-      let new_cultural_value (item trait [culture] of neighbor_turtle)
-      set culture replace-item trait culture new_cultural_value
-      setup-agent-culture-color
-    ]
-  ]
-end
-
-to explore
-  if explored? [ stop ]
-  set explored? true
-  set component-size component-size + 1
-  ask link-neighbors [ explore ]
-end
-
-to creates-links-with-same-cultural-neighbors-in-neighborhood-of-radio-radius
-  let neighborhood other turtles in-radius radius
-  ask neighborhood [
-    if overlap_between self myself = F
-    [
-      let color_for_the_link color
-      create-link-with myself [set color color_for_the_link]
-    ]
-  ]
-end
-
 to count-cultures
-  let list_of_cultures []
-  ask turtles [
-    set list_of_cultures lput culture list_of_cultures
-  ]
-  set list_of_cultures remove-duplicates list_of_cultures
+  let list_of_cultures remove-duplicates [culture-id] of patches
   set number_of_cultures length list_of_cultures
-end
-
-to find-all-components
-  set number_of_cultural_regions 0
-  ask turtles [ set explored? false]
-  loop
-  [
-    let starting_turtle one-of turtles with [ not explored? ]
-    if starting_turtle = nobody [ stop ]
-    set component-size 0
-    ask starting_turtle [
-      explore
-      set number_of_cultural_regions number_of_cultural_regions + 1
-    ]
-    if component-size > giant-component-size [
-      set giant-component-size component-size
-    ]
-  ]
 end
 """
 end

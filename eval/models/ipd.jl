@@ -11,44 +11,29 @@ world_dims(::IPDModel) = (0, 49, 0, 49)
 
 function netlogo_code(::IPDModel)
 """
-globals [randomSeed rewards palette mean-score C-C C-D D-C D-D p-mutate score-memory]
+globals [randomSeed palette mean-score p-mutate]
 
 patches-own [
   s-number
-  s-list
   previous-outcome
-  recent-scores
-  N5
+  recent-score
+  north-neighbor
+  east-neighbor
+  south-neighbor
+  west-neighbor
 ]
-
-to-report strategy-from-number [x]
-  let s []
-  repeat 4 [
-    set s fput (x mod 2) s
-    set x floor (x / 2)
-  ]
-  report s
-end
-
-to-report number-from-strategy [s]
-  report sum (map [[a b] -> a * b] s (reverse n-values 4 [i -> 2 ^ i]))
-end
 
 to setup
   clear-all
-  set C-C 4
-  set C-D 0
-  set D-C 5
-  set D-D 2
   set p-mutate 0.01
-  set score-memory 1
-  set rewards (list C-C C-D D-C D-D)
   ask patches [
     set s-number random 16
-    set s-list strategy-from-number s-number
     set previous-outcome random 4
-    set recent-scores []
-    set N5 (patch-set self neighbors4)
+    set recent-score 0
+    set north-neighbor patch-at 0 1
+    set east-neighbor patch-at 1 0
+    set south-neighbor patch-at 0 -1
+    set west-neighbor patch-at -1 0
   ]
   set mean-score 0
   reset-ticks
@@ -56,46 +41,121 @@ end
 
 to go
   ask patches [
-    let opponent one-of neighbors4
-    let my-go choice
-    let their-go [choice] of opponent
-    set previous-outcome 2 * my-go + their-go
-    update-score
+    let opponent north-neighbor
+    let r random 4
+    if r = 1 [ set opponent east-neighbor ]
+    if r = 2 [ set opponent south-neighbor ]
+    if r = 3 [ set opponent west-neighbor ]
+    let my-go ifelse-value previous-outcome = 0 [
+      floor (s-number / 8)
+    ] [
+      ifelse-value previous-outcome = 1 [
+        floor ((s-number mod 8) / 4)
+      ] [
+        ifelse-value previous-outcome = 2 [
+          floor ((s-number mod 4) / 2)
+        ] [
+          s-number mod 2
+        ]
+      ]
+    ]
+    let their-previous [previous-outcome] of opponent
+    let their-strategy [s-number] of opponent
+    let their-go ifelse-value their-previous = 0 [
+      floor (their-strategy / 8)
+    ] [
+      ifelse-value their-previous = 1 [
+        floor ((their-strategy mod 8) / 4)
+      ] [
+        ifelse-value their-previous = 2 [
+          floor ((their-strategy mod 4) / 2)
+        ] [
+          their-strategy mod 2
+        ]
+      ]
+    ]
+    let my-outcome 2 * my-go + their-go
+    set previous-outcome my-outcome
+    set recent-score 4 + my-go - (4 * their-go) + (my-go * their-go)
     ask opponent [
       set previous-outcome 2 * their-go + my-go
-      update-score
+      set recent-score 4 + their-go - (4 * my-go) + (their-go * my-go)
     ]
   ]
-  let top-scores patches with-max [ifelse-value (length recent-scores > 0) [mean recent-scores] [0]]
   ask patches [
     ifelse random-float 1 < (1 - p-mutate) [
-      set s-number [s-number] of one-of N5 with-max [ifelse-value (length recent-scores > 0) [mean recent-scores] [0]]
-      set s-list strategy-from-number s-number
+      let best-strategy s-number
+      let best-score recent-score
+      let tie-count 1
+
+      let north-score [recent-score] of north-neighbor
+      ifelse north-score > best-score [
+        set best-strategy [s-number] of north-neighbor
+        set best-score north-score
+        set tie-count 1
+      ] [
+        if north-score = best-score [
+          set tie-count tie-count + 1
+          if random tie-count = 0 [ set best-strategy [s-number] of north-neighbor ]
+        ]
+      ]
+
+      let east-score [recent-score] of east-neighbor
+      ifelse east-score > best-score [
+        set best-strategy [s-number] of east-neighbor
+        set best-score east-score
+        set tie-count 1
+      ] [
+        if east-score = best-score [
+          set tie-count tie-count + 1
+          if random tie-count = 0 [ set best-strategy [s-number] of east-neighbor ]
+        ]
+      ]
+
+      let south-score [recent-score] of south-neighbor
+      ifelse south-score > best-score [
+        set best-strategy [s-number] of south-neighbor
+        set best-score south-score
+        set tie-count 1
+      ] [
+        if south-score = best-score [
+          set tie-count tie-count + 1
+          if random tie-count = 0 [ set best-strategy [s-number] of south-neighbor ]
+        ]
+      ]
+
+      let west-score [recent-score] of west-neighbor
+      ifelse west-score > best-score [
+        set best-strategy [s-number] of west-neighbor
+        set best-score west-score
+        set tie-count 1
+      ] [
+        if west-score = best-score [
+          set tie-count tie-count + 1
+          if random tie-count = 0 [ set best-strategy [s-number] of west-neighbor ]
+        ]
+      ]
+
+      set s-number best-strategy
     ]
     [
-      mutate-strategy
+      let i random 4
+      if i = 0 [
+        ifelse s-number >= 8 [ set s-number s-number - 8 ] [ set s-number s-number + 8 ]
+      ]
+      if i = 1 [
+        ifelse (s-number mod 8) >= 4 [ set s-number s-number - 4 ] [ set s-number s-number + 4 ]
+      ]
+      if i = 2 [
+        ifelse (s-number mod 4) >= 2 [ set s-number s-number - 2 ] [ set s-number s-number + 2 ]
+      ]
+      if i = 3 [
+        ifelse (s-number mod 2) = 1 [ set s-number s-number - 1 ] [ set s-number s-number + 1 ]
+      ]
     ]
   ]
-  set mean-score mean [ifelse-value (length recent-scores > 0) [mean recent-scores] [0]] of patches
+  set mean-score mean [recent-score] of patches
   tick
-end
-
-to mutate-strategy
-  let i random 4
-  let new-val 1 - item i s-list
-  set s-list replace-item i s-list new-val
-  set s-number number-from-strategy s-list
-end
-
-to-report choice
-  report item previous-outcome s-list
-end
-
-to update-score
-  set recent-scores fput (item previous-outcome rewards) recent-scores
-  if length recent-scores > score-memory [
-    set recent-scores but-last recent-scores
-  ]
 end
 """
 end

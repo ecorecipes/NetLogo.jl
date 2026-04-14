@@ -9,8 +9,8 @@ const BUILTIN_LINK_VARS = Set([
 ])
 const BUILTIN_VARIABLE_NAMES = union(BUILTIN_TURTLE_VARS, BUILTIN_PATCH_VARS, BUILTIN_LINK_VARS)
 
-is_identifier_start(c::Char) = isletter(c) || c == '_' || c == '#' || c == '%'
-is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'', '%', '#')
+is_identifier_start(c::Char) = isletter(c) || c == '_' || c == '#' || c == '%' || c == '$'
+is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'', '%', '#', '$', '&', '/')
 
 decode_logo_string_escape(c::Char) =
   c == '"' ? '"' :
@@ -104,6 +104,16 @@ function tokenize(source::String)
       while i <= length(chars) && (isdigit(chars[i]) || chars[i] == '.')
         i += 1
         column += 1
+      end
+      # Scientific notation: e.g. 1e-4, 2.5E+10, 3e6
+      if i <= length(chars) && (chars[i] == 'e' || chars[i] == 'E')
+        i += 1; column += 1
+        if i <= length(chars) && (chars[i] == '+' || chars[i] == '-')
+          i += 1; column += 1
+        end
+        while i <= length(chars) && isdigit(chars[i])
+          i += 1; column += 1
+        end
       end
       lexeme = join(chars[start_i:i - 1])
       push!(tokens, Token(NumberToken, lexeme, parse(Float64, lexeme), span_at(start_i, i - 1, start_line, start_column)))
@@ -1182,7 +1192,9 @@ function parse_runtime_commands(source::String, model::ModelSpec, registry::Prim
 end
 
 function parse_runtime_reporter(source::String, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
-  stream = runtime_token_stream(source)
+  # Replace newlines with spaces so multi-line monitor/reporter expressions parse as one expression
+  flattened_source = replace(source, r"\r?\n" => " ")
+  stream = runtime_token_stream(flattened_source)
   skip_newlines!(stream)
   check(stream, EofToken) && throw(Diagnostic("Expected reporter.", peek(stream).span))
   expr = parse_expression(stream, model, registry, scope, 0)
@@ -1223,6 +1235,9 @@ function parse_parenthesized_command(stream::TokenStream, model::ModelSpec, regi
   inner_token = peek(stream)
   inner_token.kind == IdentifierToken || throw(Diagnostic("expected command", inner_token.span))
   name = canonical_name(inner_token.lexeme)
+  # Normalize legacy aliases
+  if name == "IF-ELSE"; name = "IFELSE"; end
+  if name == "IF-ELSE-VALUE"; name = "IFELSE-VALUE"; end
   advance!(stream)
 
   # Parse the command's normal arguments
@@ -1252,7 +1267,26 @@ function parse_parenthesized_command(stream::TokenStream, model::ModelSpec, regi
       skip_newlines!(stream)
       check(stream, RParenToken) && break
       if check(stream, LBracketToken)
-        # This is the else block (a command block not preceded by a condition)
+        # Could be an else block (a command block not preceded by a condition)
+        # OR a condition expression starting with a reporter block like [ breed ] of x
+        # Try as condition expression first when we expect one (even number of args)
+        if iseven(length(args))
+          saved_index = stream.index
+          try
+            cond = parse_expression(stream, model, registry, scope, 0)
+            skip_newlines!(stream)
+            if check(stream, LBracketToken)
+              push!(args, cond)
+              push!(args, parse_command_block(stream, model, registry, scope))
+              skip_newlines!(stream)
+              continue
+            end
+          catch err
+            err isa Diagnostic || rethrow()
+          end
+          stream.index = saved_index
+        end
+        # Fall back to else block
         push!(args, parse_command_block(stream, model, registry, scope))
         skip_newlines!(stream)
         break
@@ -1309,6 +1343,8 @@ function parse_statement(stream::TokenStream, model::ModelSpec, registry::Primit
 
   token.kind == IdentifierToken || throw(Diagnostic("expected command", token.span))
   name = canonical_name(token.lexeme)
+  # Normalize legacy aliases
+  if name == "IF-ELSE"; name = "IFELSE"; end
   advance!(stream)
 
   if name == "FOREACH"
@@ -1320,14 +1356,18 @@ function parse_statement(stream::TokenStream, model::ModelSpec, registry::Primit
     args = parse_call_arguments(
       stream, spec.syntax, model, registry, scope;
       expression_min_precedence=0,
-      repeatable_across_newlines=name != "RUN")
+      repeatable_across_newlines=false)
     bindings = name == "LET" && !isempty(args) && args[1] isa SymbolArg ? [args[1].name] : String[]
     return CommandCall(name, args, span_union(token.span, isempty(args) ? token.span : spanof(last(args)))), bindings
   end
 
   procedure = get(model.procedures, name, nothing)
   if procedure !== nothing && !procedure.is_reporter
-    args = Any[parse_expression(stream, model, registry, scope, 0) for _ in procedure.inputs]
+    args = Any[]
+    for (i, _) in enumerate(procedure.inputs)
+      i > 1 && skip_newlines!(stream)
+      push!(args, parse_expression(stream, model, registry, scope, 0))
+    end
     return CommandCall(name, args, span_union(token.span, isempty(args) ? token.span : spanof(last(args)))), String[]
   end
 
@@ -1382,13 +1422,13 @@ function parse_foreach_statement(stream::TokenStream, token::Token, model::Model
 
   while true
     skip_newlines!(stream)
-    peek(stream).kind in (EofToken, NewlineToken, RBracketToken) &&
+    peek(stream).kind in (EofToken, NewlineToken, RBracketToken, RParenToken) &&
       throw(Diagnostic("FOREACH expects at least one list and an anonymous command", peek(stream).span))
 
     saved_index = stream.index
     try
       task = parse_command_task(stream, model, registry, scope)
-      if !isempty(args) && peek(stream).kind in (EofToken, NewlineToken, RBracketToken)
+      if !isempty(args) && peek(stream).kind in (EofToken, NewlineToken, RBracketToken, RParenToken)
         push!(args, task)
         return CommandCall("FOREACH", args, span_union(token.span, spanof(last(args)))), String[]
       end
@@ -1412,13 +1452,45 @@ function parse_call_arguments(
   args = Any[]
   for (index, mask) in enumerate(syntax.right)
     stop_repeatable_at_newline = !repeatable_across_newlines && is_repeatable(mask)
-    stop_repeatable_at_newline || skip_newlines!(stream)
+    # Skip newlines between args: always in paren form, and also when
+    # default_count is set (known arg count makes newline skipping safe).
+    if !stop_repeatable_at_newline || (syntax.default_count > 0)
+      skip_newlines!(stream)
+    end
     bare_mask = strip_flags(mask)
     mode = effective_arg_mode(mask, syntax.arg_modes[index])
     if is_repeatable(mask)
-      while can_start_argument(stream, bare_mask, model, registry)
+      # In non-parenthesized form, limit total args to default_count if set
+      max_args = (repeatable_across_newlines || syntax.default_count < 0) ? typemax(Int) : syntax.default_count
+      while length(args) < max_args && can_start_argument(stream, bare_mask, model, registry)
+        # In non-parenthesized form, don't consume a [ that looks like a
+        # command block as a repeatable arg — it likely belongs to the parent.
+        if stop_repeatable_at_newline && !isempty(args) && peek(stream).kind == LBracketToken
+          if looks_like_command_block(stream, model, registry)
+            break
+          end
+        end
         push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
-        check(stream, NewlineToken) && break
+        if stop_repeatable_at_newline
+          if check(stream, NewlineToken)
+            # Peek past newline: continue only for unambiguous expression starters
+            saved_nl = stream.index
+            skip_newlines!(stream)
+            next_kind = peek(stream).kind
+            # When default_count is set and we still need more args, be more
+            # permissive — accept any token that can start an argument.
+            if max_args < typemax(Int) && length(args) < max_args
+              if can_start_argument(stream, bare_mask, model, registry)
+                continue
+              end
+            elseif next_kind in (StringToken, NumberToken, LParenToken) &&
+               can_start_argument(stream, bare_mask, model, registry)
+              continue
+            end
+            stream.index = saved_nl
+            break
+          end
+        end
         skip_newlines!(stream)
       end
       continue
@@ -1429,6 +1501,24 @@ function parse_call_arguments(
     push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
   end
   args
+end
+
+# Peek inside a [ ... ] to check if it starts with a known command,
+# indicating it's a command block rather than a list/reporter-block argument.
+function looks_like_command_block(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry)
+  peek(stream).kind == LBracketToken || return false
+  idx = stream.index + 1
+  while idx <= length(stream.tokens) && stream.tokens[idx].kind == NewlineToken
+    idx += 1
+  end
+  idx > length(stream.tokens) && return false
+  token = stream.tokens[idx]
+  token.kind == IdentifierToken || return false
+  name = canonical_name(token.lexeme)
+  get_command(registry, name) !== nothing && return true
+  proc = get(model.procedures, name, nothing)
+  proc !== nothing && !proc.is_reporter && return true
+  false
 end
 
 function can_start_argument(stream::TokenStream, mask::Int,
@@ -1603,6 +1693,7 @@ function parse_reporter_block(stream::TokenStream, model::ModelSpec, registry::P
   skip_newlines!(stream)
   params = something(try_parse_task_parameters!(stream), String[])
   task_scope = union(scope, Set(params))
+  skip_newlines!(stream)
   expr = parse_expression(stream, model, registry, task_scope, 0)
   skip_newlines!(stream)
   stop = expect!(stream, RBracketToken, "expected ']' to end a reporter block")
@@ -1677,6 +1768,7 @@ function parse_anonymous_task_expression(stream::TokenStream, model::ModelSpec, 
   params = try_parse_task_parameters!(stream)
   params === nothing && throw(Diagnostic("expected anonymous procedure inputs", peek(stream).span))
   task_scope = union(scope, Set(params))
+  skip_newlines!(stream)
   body_start = stream.index
 
   try
@@ -1704,7 +1796,16 @@ function parse_ifelse_value_call(stream::TokenStream, token::Token, model::Model
   push!(args, parse_reporter_block(stream, model, registry, scope))
   skip_newlines!(stream)
 
-  while peek(stream).kind ∉ (EofToken, NewlineToken, RBracketToken, RParenToken, CommaToken)
+  while peek(stream).kind ∉ (EofToken, RBracketToken, RParenToken, CommaToken)
+    if check(stream, NewlineToken)
+      # Peek past newlines to see if there's another block or condition
+      saved = stream.index
+      skip_newlines!(stream)
+      if !check(stream, LBracketToken) && !can_start_expression(peek(stream))
+        stream.index = saved
+        break
+      end
+    end
     if check(stream, LBracketToken)
       push!(args, parse_reporter_block(stream, model, registry, scope))
       break
@@ -1800,7 +1901,17 @@ function parse_list_literal_item(stream::TokenStream, model::ModelSpec, registry
     elseif uname == "FALSE"
       advance!(stream)
       return BoolLiteral(false, token.span)
+    elseif uname == "NOBODY"
+      advance!(stream)
+      return NobodyLiteral(token.span)
     end
+    # Accept identifiers as variable references in list literals
+    # (e.g., color constants like white, red, or other variables)
+    advance!(stream)
+    return VariableRef(canonical_name(token.lexeme), token.span, false)
+  elseif token.kind == LParenToken
+    # Accept parenthesized expressions in list literals (e.g., [(red)])
+    return parse_expression(stream, model, registry, scope, 0)
   end
   throw(Diagnostic("expected literal value in list (number, string, boolean, or nested list)", token.span))
 end
@@ -1849,8 +1960,29 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
   left = parse_prefix(stream, model, registry, scope)
   while true
     token = peek(stream)
-    if token.kind in (EofToken, NewlineToken, RBracketToken, RParenToken, CommaToken)
+    if token.kind in (EofToken, RBracketToken, RParenToken, CommaToken)
       break
+    end
+
+    # At newlines, check if the next non-newline token is an infix operator;
+    # if so, continue the expression across the line break.
+    if token.kind == NewlineToken
+      saved_index = stream.index
+      skip_newlines!(stream)
+      nxt = peek(stream)
+      is_continuation = false
+      if nxt.kind == OperatorToken || nxt.kind == IdentifierToken
+        nxt_name = canonical_name(nxt.lexeme)
+        nxt_spec = get_reporter(registry, nxt_name)
+        if nxt_spec !== nothing && nxt_spec.syntax.left != VoidType && nxt_spec.syntax.precedence >= min_precedence
+          is_continuation = true
+        end
+      end
+      if !is_continuation
+        stream.index = saved_index
+        break
+      end
+      token = peek(stream)
     end
 
     op_name =
@@ -1887,7 +2019,11 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
         continue
       end
       push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, spec.syntax.precedence + 1))
-      skip_newlines!(stream)
+      # Only skip newlines between arguments, not after the last one;
+      # the main expression loop handles newline continuation decisions.
+      if index < length(spec.syntax.right)
+        skip_newlines!(stream)
+      end
     end
 
     left = ReporterCall(op_name, args, span_union(spanof(left), spanof(last(args))))
@@ -1948,7 +2084,7 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
   elseif name == "NOBODY"
     advance!(stream)
     return NobodyLiteral(token.span)
-  elseif name == "IFELSE-VALUE"
+  elseif name == "IFELSE-VALUE" || name == "IF-ELSE-VALUE"
     advance!(stream)
     return parse_ifelse_value_call(stream, token, model, registry, scope)
   end
@@ -1991,7 +2127,22 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
   procedure = get(model.procedures, name, nothing)
   if procedure !== nothing && procedure.is_reporter
     advance!(stream)
-    args = Any[parse_expression(stream, model, registry, scope, PrefixPrecedence) for _ in procedure.inputs]
+    args = Any[]
+    for (i, _) in enumerate(procedure.inputs)
+      # Skip newlines between args; for the first arg, only skip if a clear
+      # expression starter follows (prevents consuming the next statement).
+      if i > 1
+        skip_newlines!(stream)
+      elseif check(stream, NewlineToken)
+        saved = stream.index
+        skip_newlines!(stream)
+        nxt = peek(stream).kind
+        if !(nxt in (LParenToken, NumberToken, StringToken, LBracketToken))
+          stream.index = saved
+        end
+      end
+      push!(args, parse_expression(stream, model, registry, scope, PrefixPrecedence))
+    end
     last_span = isempty(args) ? token.span : spanof(last(args))
     return ReporterCall(name, args, span_union(token.span, last_span))
   end
@@ -2002,7 +2153,7 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
     args = parse_call_arguments(
       stream, spec.syntax, model, registry, scope;
       expression_min_precedence=PrefixPrecedence,
-      repeatable_across_newlines=!(name in ("RUNRESULT", "RUN-RESULT")))
+      repeatable_across_newlines=false)
     last_span = isempty(args) ? token.span : spanof(last(args))
     return ReporterCall(name, args, span_union(token.span, last_span))
   end

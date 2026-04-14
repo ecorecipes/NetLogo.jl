@@ -9,7 +9,7 @@ using ..NetLogo: PrimitiveRegistry, register_primitive!, REPORTER, COMMAND,
   StringType, ListType, WildcardType, NumberType, BooleanType,
   LogoRuntimeError, Context,
   get_patch, world_width, world_height,
-  resolve_file_path
+  resolve_file_path, render_view_pixels
 
 import ..NetLogo: logo_string
 
@@ -248,7 +248,18 @@ function register_extension!(registry::PrimitiveRegistry)
 
   register_primitive!(registry, "BITMAP:FROM-VIEW", REPORTER,
     reporter_syntax(ret=WildcardType),
-    (ctx, args) -> LogoBitmap(1, 1))  # headless stub
+    (ctx, args) -> begin
+      pixels = render_view_pixels(ctx.runtime)
+      h, w = size(pixels)
+      bmp_pixels = Matrix{NTuple{3, UInt8}}(undef, h, w)
+      for row in 1:h, col in 1:w
+        r, g, b, _ = pixels[row, col]
+        bmp_pixels[row, col] = (UInt8(clamp(round(Int, r), 0, 255)),
+                                 UInt8(clamp(round(Int, g), 0, 255)),
+                                 UInt8(clamp(round(Int, b), 0, 255)))
+      end
+      LogoBitmap(w, h, bmp_pixels)
+    end)
 
   register_primitive!(registry, "BITMAP:SCALED", REPORTER,
     reporter_syntax(right=[WildcardType, NumberType, NumberType], ret=WildcardType),

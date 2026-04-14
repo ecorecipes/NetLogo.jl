@@ -2,7 +2,7 @@
 
 `NetLogo.jl` is a clean-room, headless-first Julia implementation of the NetLogo language and runtime. It focuses on compiling, loading, and executing NetLogo models from Julia while staying behaviorally compatible with the headless language surface.
 
-The package currently covers the 2D headless runtime, `.nlogo` / `.nls` model loading, interface metadata, plotting, import/export, drawing, and the extension surface needed by the evaluation suite. Desktop GUI workflows, HubNet, and 3D semantics remain out of scope.
+The package currently covers the 2D headless runtime, `.nlogo` / `.nls` model loading, interface metadata, plotting, import/export, drawing, lightweight browser/notebook GUI backends, and the extension surface needed by the evaluation suite. The full desktop application workflow, HubNet, and 3D semantics remain out of scope.
 
 Repository: <https://github.com/ecorecipes/NetLogo.jl>
 
@@ -11,6 +11,7 @@ Repository: <https://github.com/ecorecipes/NetLogo.jl>
 - headless parser, compiler, interpreter, and runtime state
 - string-macro DSL via `netlogo"""..."""`
 - file-backed model loading with `__includes`
+- host-side GUI backends via a local web server and notebook/Pluto embeds
 - extension support for `csv`, `table`, `nw`, `profiler`, `sound`, `gis`, `array`, `bitmap`, `fp`, `matrix`, `ls`, `rnd`, `store`, and `time`
 - evaluation and comparison tooling in `eval/` for Julia-vs-Java NetLogo runs
 
@@ -64,6 +65,28 @@ using NetLogo
 model = load_model("path/to/model.nlogo")
 runtime = create_runtime(model; seed=1)
 call!(runtime, "setup")
+```
+
+To expose interface widgets, plots, output, and the rendered view through a lightweight local GUI:
+
+```julia
+using NetLogo
+
+model = load_model("path/to/model.nlogo")
+backend = start_web_gui(model; seed=1, port=8081)
+
+web_gui_url(backend)
+```
+
+For Pluto or other notebook workflows, wrap the same backend as an embeddable iframe:
+
+```julia
+using NetLogo
+
+model = load_model("path/to/model.nlogo")
+gui = pluto_gui(model; seed=1, port=8081, width=1000, height=800)
+
+gui
 ```
 
 ## Documentation

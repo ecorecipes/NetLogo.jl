@@ -1344,7 +1344,7 @@ function histogram!(runtime::RuntimeState, values_value)
   pen = require_current_plot_pen(runtime)
   pen.interval > 0 || throw(LogoRuntimeError(
     "You cannot histogram with a plot-pen-interval of $(error_logo_string(pen.interval))."))
-  values = [numeric(value) for value in list_argument(values_value, "histogram") if is_logo_number(value)]
+  values = Float64[numeric(value) for value in list_argument(values_value, "histogram") if is_logo_number(value)]
   bars, ceiling = plot_histogram_bars(plot.x_min, plot.x_max, pen.interval, values)
   soft_reset_plot_pen!(pen)
   plot.auto_plot_y && grow_plot_range_y!(plot, Float64(ceiling))
@@ -7865,63 +7865,63 @@ function build_default_registry()
     (ctx, args) -> nothing)
   register_primitive!(registry, "HUBNET-SEND-MESSAGE", COMMAND, command_syntax(right=[WildcardType, WildcardType], agent_classes="O---"),
     (ctx, args) -> nothing)
-  register_primitive!(registry, "SET-CURRENT-PLOT", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
+  register_primitive!(registry, "SET-CURRENT-PLOT", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
     (ctx, args) -> set_current_plot!(ctx.runtime, String(args[1])))
-  register_primitive!(registry, "CREATE-TEMPORARY-PLOT-PEN", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
+  register_primitive!(registry, "CREATE-TEMPORARY-PLOT-PEN", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
     (ctx, args) -> create_temporary_plot_pen!(ctx.runtime, String(args[1])))
-  register_primitive!(registry, "SET-CURRENT-PLOT-PEN", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
+  register_primitive!(registry, "SET-CURRENT-PLOT-PEN", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
     (ctx, args) -> set_current_plot_pen!(ctx.runtime, String(args[1])))
-  register_primitive!(registry, "CLEAR-PLOT", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "CLEAR-PLOT", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> clear_current_plot!(ctx.runtime))
-  register_primitive!(registry, "CLEAR-ALL-PLOTS", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "CLEAR-ALL-PLOTS", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> clear_all_plots!(ctx.runtime))
-  register_primitive!(registry, "SETUP-PLOTS", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "SETUP-PLOTS", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> setup_plots!(ctx))
-  register_primitive!(registry, "UPDATE-PLOTS", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "UPDATE-PLOTS", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> update_plots!(ctx))
-  register_primitive!(registry, "PLOT", COMMAND, command_syntax(right=[NumberType], agent_classes="O---"),
+  register_primitive!(registry, "PLOT", COMMAND, command_syntax(right=[NumberType], agent_classes="OTPL"),
     (ctx, args) -> plot_y!(ctx.runtime, args[1]))
-  register_primitive!(registry, "PLOTXY", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="O---"),
+  register_primitive!(registry, "PLOTXY", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="OTPL"),
     (ctx, args) -> plot_xy!(ctx.runtime, args[1], args[2]))
-  register_primitive!(registry, "HISTOGRAM", COMMAND, command_syntax(right=[ListType], agent_classes="O---"),
+  register_primitive!(registry, "HISTOGRAM", COMMAND, command_syntax(right=[ListType], agent_classes="OTPL"),
     (ctx, args) -> histogram!(ctx.runtime, args[1]))
-  register_primitive!(registry, "SET-HISTOGRAM-NUM-BARS", COMMAND, command_syntax(right=[NumberType], agent_classes="O---"),
+  register_primitive!(registry, "SET-HISTOGRAM-NUM-BARS", COMMAND, command_syntax(right=[NumberType], agent_classes="OTPL"),
     (ctx, args) -> set_histogram_num_bars!(ctx.runtime, args[1]))
-  register_primitive!(registry, "SET-PLOT-PEN-INTERVAL", COMMAND, command_syntax(right=[NumberType], agent_classes="O---"),
+  register_primitive!(registry, "SET-PLOT-PEN-INTERVAL", COMMAND, command_syntax(right=[NumberType], agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_interval!(ctx.runtime, args[1]))
-  register_primitive!(registry, "SET-PLOT-PEN-MODE", COMMAND, command_syntax(right=[NumberType], agent_classes="O---"),
+  register_primitive!(registry, "SET-PLOT-PEN-MODE", COMMAND, command_syntax(right=[NumberType], agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_mode!(ctx.runtime, args[1]))
-  register_primitive!(registry, "SET-PLOT-PEN-COLOR", COMMAND, command_syntax(right=[NumberType | ListType], agent_classes="O---"),
+  register_primitive!(registry, "SET-PLOT-PEN-COLOR", COMMAND, command_syntax(right=[NumberType | ListType], agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_color!(ctx.runtime, args[1]))
-  register_primitive!(registry, "PLOT-PEN-DOWN", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "PLOT-PEN-DOWN", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_down!(ctx.runtime, true))
-  register_primitive!(registry, "PLOT-PEN-UP", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "PLOT-PEN-UP", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_down!(ctx.runtime, false))
-  register_primitive!(registry, "PLOT-PEN-RESET", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "PLOT-PEN-RESET", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> reset_plot_pen!(ctx.runtime))
-  register_primitive!(registry, "__PLOT-PEN-HIDE", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "__PLOT-PEN-HIDE", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_hidden!(ctx.runtime, true))
-  register_primitive!(registry, "__PLOT-PEN-SHOW", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "__PLOT-PEN-SHOW", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_pen_hidden!(ctx.runtime, false))
-  register_primitive!(registry, "AUTO-PLOT-ON", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-ON", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, true, true))
-  register_primitive!(registry, "AUTO-PLOT-OFF", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-OFF", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, false, false))
-  register_primitive!(registry, "AUTO-PLOT-X-ON", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-X-ON", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, true, plot_autoplot_y(ctx.runtime)))
-  register_primitive!(registry, "AUTO-PLOT-Y-ON", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-Y-ON", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, plot_autoplot_x(ctx.runtime), true))
-  register_primitive!(registry, "AUTO-PLOT-X-OFF", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-X-OFF", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, false, plot_autoplot_y(ctx.runtime)))
-  register_primitive!(registry, "AUTO-PLOT-Y-OFF", COMMAND, command_syntax(agent_classes="O---"),
+  register_primitive!(registry, "AUTO-PLOT-Y-OFF", COMMAND, command_syntax(agent_classes="OTPL"),
     (ctx, args) -> set_plot_autoplot!(ctx.runtime, plot_autoplot_x(ctx.runtime), false))
-  register_primitive!(registry, "SET-PLOT-X-RANGE", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="O---"),
+  register_primitive!(registry, "SET-PLOT-X-RANGE", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="OTPL"),
     (ctx, args) -> set_plot_range!(ctx.runtime, args[1], args[2]; is_x=true))
-  register_primitive!(registry, "SET-PLOT-Y-RANGE", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="O---"),
+  register_primitive!(registry, "SET-PLOT-Y-RANGE", COMMAND, command_syntax(right=[NumberType, NumberType], agent_classes="OTPL"),
     (ctx, args) -> set_plot_range!(ctx.runtime, args[1], args[2]; is_x=false))
-  register_primitive!(registry, "EXPORT-PLOT", COMMAND, command_syntax(right=[StringType, StringType], agent_classes="O---"),
+  register_primitive!(registry, "EXPORT-PLOT", COMMAND, command_syntax(right=[StringType, StringType], agent_classes="OTPL"),
     (ctx, args) -> export_plot!(ctx.runtime, String(args[1]), String(args[2])))
-  register_primitive!(registry, "EXPORT-ALL-PLOTS", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
+  register_primitive!(registry, "EXPORT-ALL-PLOTS", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
     (ctx, args) -> export_all_plots!(ctx.runtime, String(args[1])))
   register_primitive!(registry, "EXPORT-OUTPUT", COMMAND, command_syntax(right=[StringType]),
     (ctx, args) -> export_output!(ctx.runtime, String(args[1])))
@@ -8067,7 +8067,7 @@ function build_default_registry()
       nothing
     end)
   register_primitive!(registry, "RUNRESULT", REPORTER,
-    reporter_syntax(right=[WildcardType, WildcardType | RepeatableType], ret=WildcardType, arg_modes=[:reporter_task, :eval]),
+    reporter_syntax(right=[WildcardType, WildcardType | RepeatableType], ret=WildcardType, arg_modes=[:reporter_task, :eval], default_count=1),
     function (ctx, args)
       if args[1] isa AbstractString
         isempty(args[2:end]) || throw(LogoRuntimeError("runresult doesn't accept further inputs if the first is a string"))
@@ -8076,7 +8076,7 @@ function build_default_registry()
       invoke_reporter_task(ctx, args[1], Any[args[2:end]...])
     end)
   register_primitive!(registry, "RUN-RESULT", REPORTER,
-    reporter_syntax(right=[WildcardType, WildcardType | RepeatableType], ret=WildcardType, arg_modes=[:reporter_task, :eval]),
+    reporter_syntax(right=[WildcardType, WildcardType | RepeatableType], ret=WildcardType, arg_modes=[:reporter_task, :eval], default_count=1),
     function (ctx, args)
       if args[1] isa AbstractString
         isempty(args[2:end]) || throw(LogoRuntimeError("runresult doesn't accept further inputs if the first is a string"))
@@ -8717,13 +8717,13 @@ function build_default_registry()
     (ctx, args) -> collection_butlast(args[1]))
   register_primitive!(registry, "ITEM", REPORTER, reporter_syntax(right=[NumberType, WildcardType], ret=WildcardType),
     (ctx, args) -> collection_item(args[1], args[2]))
-  register_primitive!(registry, "LIST", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=ListType),
+  register_primitive!(registry, "LIST", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=ListType, default_count=2),
     (ctx, args) -> Any[args...])
   register_primitive!(registry, "MODES", REPORTER, reporter_syntax(right=[ListType], ret=ListType),
     (ctx, args) -> collection_modes(args[1]))
   register_primitive!(registry, "RANGE", REPORTER, reporter_syntax(right=[NumberType | RepeatableType], ret=ListType),
     (ctx, args) -> range_values(args))
-  register_primitive!(registry, "SENTENCE", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=ListType),
+  register_primitive!(registry, "SENTENCE", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=ListType, default_count=2),
     function (ctx, args)
       result = Any[]
       for arg in args
@@ -8735,7 +8735,7 @@ function build_default_registry()
       end
       result
     end)
-  register_primitive!(registry, "WORD", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=StringType),
+  register_primitive!(registry, "WORD", REPORTER, reporter_syntax(right=[WildcardType | RepeatableType], ret=StringType, default_count=2),
     (ctx, args) -> join(logo_string(arg) for arg in args))
   register_primitive!(registry, "__APPLY", COMMAND,
     command_syntax(right=[CommandType, ListType], arg_modes=[:command_task, :eval]),
@@ -8868,7 +8868,7 @@ function build_default_registry()
     (ctx, args) -> Float64(world_height(ctx.runtime.world)))
   register_primitive!(registry, "PATCH-SIZE", REPORTER, reporter_syntax(ret=NumberType),
     (ctx, args) -> ctx.runtime.world.patch_size)
-  register_primitive!(registry, "PLOT-PEN-EXISTS?", REPORTER, reporter_syntax(right=[StringType], ret=BooleanType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-PEN-EXISTS?", REPORTER, reporter_syntax(right=[StringType], ret=BooleanType, agent_classes="OTPL"),
     (ctx, args) -> plot_pen_exists(ctx.runtime, String(args[1])))
   register_primitive!(registry, "AUTOPLOT?", REPORTER, reporter_syntax(ret=BooleanType, agent_classes="O---"),
     (ctx, args) -> plot_autoplot(ctx.runtime))
@@ -8876,15 +8876,15 @@ function build_default_registry()
     (ctx, args) -> plot_autoplot_x(ctx.runtime))
   register_primitive!(registry, "AUTOPLOTY?", REPORTER, reporter_syntax(ret=BooleanType, agent_classes="O---"),
     (ctx, args) -> plot_autoplot_y(ctx.runtime))
-  register_primitive!(registry, "PLOT-NAME", REPORTER, reporter_syntax(ret=StringType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-NAME", REPORTER, reporter_syntax(ret=StringType, agent_classes="OTPL"),
     (ctx, args) -> plot_name(ctx.runtime))
-  register_primitive!(registry, "PLOT-X-MIN", REPORTER, reporter_syntax(ret=NumberType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-X-MIN", REPORTER, reporter_syntax(ret=NumberType, agent_classes="OTPL"),
     (ctx, args) -> plot_x_min(ctx.runtime))
-  register_primitive!(registry, "PLOT-X-MAX", REPORTER, reporter_syntax(ret=NumberType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-X-MAX", REPORTER, reporter_syntax(ret=NumberType, agent_classes="OTPL"),
     (ctx, args) -> plot_x_max(ctx.runtime))
-  register_primitive!(registry, "PLOT-Y-MIN", REPORTER, reporter_syntax(ret=NumberType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-Y-MIN", REPORTER, reporter_syntax(ret=NumberType, agent_classes="OTPL"),
     (ctx, args) -> plot_y_min(ctx.runtime))
-  register_primitive!(registry, "PLOT-Y-MAX", REPORTER, reporter_syntax(ret=NumberType, agent_classes="O---"),
+  register_primitive!(registry, "PLOT-Y-MAX", REPORTER, reporter_syntax(ret=NumberType, agent_classes="OTPL"),
     (ctx, args) -> plot_y_max(ctx.runtime))
   register_primitive!(registry, "SHAPES", REPORTER, reporter_syntax(ret=ListType),
     (ctx, args) -> Any[DEFAULT_SHAPE_NAMES...])
@@ -9018,6 +9018,48 @@ function build_default_registry()
     (ctx, args) -> logical(args[1]) || logical(args[2]))
   register_primitive!(registry, "XOR", REPORTER, reporter_syntax(left=BooleanType, right=[BooleanType], ret=BooleanType, precedence=XorPrecedence),
     (ctx, args) -> logical(args[1]) != logical(args[2]))
+
+  # Mouse reporters (headless defaults)
+  register_primitive!(registry, "MOUSE-DOWN?", REPORTER, reporter_syntax(ret=BooleanType),
+    (ctx, args) -> false)
+  register_primitive!(registry, "MOUSE-XCOR", REPORTER, reporter_syntax(ret=NumberType),
+    (ctx, args) -> 0.0)
+  register_primitive!(registry, "MOUSE-YCOR", REPORTER, reporter_syntax(ret=NumberType),
+    (ctx, args) -> 0.0)
+  register_primitive!(registry, "MOUSE-INSIDE?", REPORTER, reporter_syntax(ret=BooleanType),
+    (ctx, args) -> false)
+
+  # Math constants
+  register_primitive!(registry, "PI", REPORTER, reporter_syntax(ret=NumberType),
+    (ctx, args) -> π)
+  register_primitive!(registry, "E", REPORTER, reporter_syntax(ret=NumberType),
+    (ctx, args) -> MathConstants.e)
+
+  # System dynamics stubs
+  register_primitive!(registry, "SYSTEM-DYNAMICS-SETUP", COMMAND, command_syntax(agent_classes="O---"),
+    (ctx, args) -> nothing)
+  register_primitive!(registry, "SYSTEM-DYNAMICS-GO", COMMAND, command_syntax(agent_classes="O---"),
+    (ctx, args) -> nothing)
+  register_primitive!(registry, "SYSTEM-DYNAMICS-DO-PLOT", COMMAND, command_syntax(agent_classes="O---"),
+    (ctx, args) -> nothing)
+
+  # Legacy / internal commands
+  register_primitive!(registry, "__SET-LINE-THICKNESS", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),
+    (ctx, args) -> nothing)
+  register_primitive!(registry, "__HUBNET-MAKE-PLOT-NARROWCAST", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
+    (ctx, args) -> nothing)
+
+  register_primitive!(registry, "__HUBNET-CLEAR-PLOT", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
+    (ctx, args) -> nothing)
+
+  register_primitive!(registry, "__HUBNET-PLOT", COMMAND, command_syntax(right=[StringType, NumberType], agent_classes="OTPL"),
+    (ctx, args) -> nothing)
+
+  register_primitive!(registry, "__HUBNET-PLOT-PEN-DOWN", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
+    (ctx, args) -> nothing)
+
+  register_primitive!(registry, "__HUBNET-PLOT-PEN-UP", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
+    (ctx, args) -> nothing)
 
   registry
 end

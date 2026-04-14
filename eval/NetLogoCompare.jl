@@ -18,7 +18,7 @@ export AbstractBenchmarkModel, ComparisonReport, CalibratedReport,
        compare_model, compare_model_calibrated,
        print_report, print_calibrated_report, save_csv, save_calibrated_csv,
        model_name, netlogo_code, nlogo_source, n_ticks, tracked_globals,
-       pre_setup_commands, topology, world_dims,
+       pre_setup_commands, topology, world_dims, setup_files,
        SIRModel, WolfSheepModel, DiffusionModel, FireModel,
        SchellingModel, VirusModel,
        # Library models
@@ -37,14 +37,42 @@ export AbstractBenchmarkModel, ComparisonReport, CalibratedReport,
        UnitCohesionModel, DatingModel,
        # GIS ClassModels
        BombScenarioModel, MultidrugResistantModel, HikingElevationModel,
-       DiffusionOfHIVModel, SleuthModel, RiseOfRadicalismModel,
-       # Extension models (table, matrix, rnd, nw, profiler, csv)
-       CropRotationModel, RationalEvolvingPDModel, SearchPathModel,
-       BullwhipEffectModel, InfiniteLifeModel, ResilientTeamModel,
-       PrivacyOpinionModel, ArtificialEconomyModel, VoronoiVoterModel,
-       CyberspaceOpinionModel, ABTgcModel,
-        # Modeling Commons new candidates
-        EvolutionOfNormsModel, LassaVirusModel, AxelrodCulturalModel
+        DiffusionOfHIVModel, SleuthModel, RiseOfRadicalismModel,
+        # Extension models (table, matrix, rnd, nw, profiler, csv)
+        CropRotationModel, RationalEvolvingPDModel, SearchPathModel,
+        BullwhipEffectModel, InfiniteLifeModel, ResilientTeamModel,
+        PrivacyOpinionModel, ArtificialEconomyModel, VoronoiVoterModel,
+        CyberspaceOpinionModel, ABTgcModel,
+         # Modeling Commons new candidates
+         EvolutionOfNormsModel, LassaVirusModel, AxelrodCulturalModel,
+         MousetrapsModel, FireBenchmarkModel,
+         # Modeling Commons classic models
+         DLASimpleModel, BoilingModel, SolidDiffusionModel, FlockingModel,
+         SandModel, RopeModel, PolymerDynamicsModel, ThermostatModel,
+         CrystallizationModel, MimicryModel,
+         # NW extension eval wrappers
+         SuperDiffuserModel, DrugUseModel, ProductsModel, SocialInfluenceModel,
+         ParticipatoryDisinformationModel, InfoDiffusionModel,
+         RecruitingSupportersModel, GisHillClimberModel, GisBurkinaModel, RhinoPoachingModel,
+         # Additional NW extension models
+         MinorityBeliefModel, SlowSpreadModel, SpreadingGroupsModel, RecruitingModel,
+         FakeNewsModel,
+         # Additional extension models (nw, table, rnd)
+         FlockingNetworkModel, MisinformationSBFCModel, SimpleMarketModel,
+         SpatialAttitudeModel, ContagionNWModel, DiffusionNetworkModel,
+         # Array/Matrix extension models
+         MinimalSISModel, CulturalDiffusionModel, SugarscapeCultureModel,
+         CompetitionLearningModel,
+         # Table/Array combo + Table models
+         BabySittingModel, WisdomCrowdModel, FungalBioremediationModel,
+         # nw+bitstring, matrix+rnd, rnd extension models
+         ParticipatoryDisinfoModel, BlackBoxModel, SpatialOpinionModel,
+         # table:group-agents, nw generators+modularity, nw network dynamics
+         ForestDewdneyModel, SocialNetworkDiffusionModel, DrugUseOverdoseModel,
+         # nw weak-component-clusters+metrics, table:remove in go loop
+         RecruitingMovementModel, SimpleMarketRandomModel,
+         # CSV extension models (csv:from-file, csv:to-file, csv:from-row with file-open)
+         CsvPopulationModel, CsvNetworkForagingModel
 
 using Statistics
 using Printf
@@ -98,11 +126,24 @@ function model_name end
 """Return optional extra turtle shape definitions (default: empty)."""
 extra_shapes(::AbstractBenchmarkModel) = ""
 
+"""Create auxiliary files (e.g. CSV data) in the given directory before running.
+   Called for both Julia and Java runners. Default: no files needed."""
+setup_files(::AbstractBenchmarkModel, ::AbstractString) = nothing
+
 """Return world dimensions as (min_px, max_px, min_py, max_py). Default: -16..16."""
 world_dims(::AbstractBenchmarkModel) = (-16, 16, -16, 16)
 
 """Return world topology as (wrap_x, wrap_y). Default: torus (true, true)."""
 topology(::AbstractBenchmarkModel) = (true, true)
+
+function runtime_topology_mode(NetLogo::Module, model::AbstractBenchmarkModel)
+    wrap_x, wrap_y = topology(model)
+    if wrap_x
+        wrap_y ? getfield(NetLogo, :Torus) : getfield(NetLogo, :VerticalCylinder)
+    else
+        wrap_y ? getfield(NetLogo, :HorizontalCylinder) : getfield(NetLogo, :BoxTopology)
+    end
+end
 
 """Return NetLogo commands to run before setup (e.g., widget defaults). Default: empty."""
 pre_setup_commands(::AbstractBenchmarkModel) = ""
@@ -282,6 +323,11 @@ star
 false
 0
 Polygon -7500403 true true 151 1 185 108 298 108 207 175 242 282 151 216 59 282 94 175 3 108 116 108
+
+mouse side
+false
+0
+Circle -7500403 true true 0 0 300
 """)
     if !isempty(extra_shapes(model))
         print(buf, "\n", extra_shapes(model), "\n")
@@ -393,6 +439,21 @@ end
 
 # ── Julia runner ──────────────────────────────────────────────────────
 
+function _read_tracked_global(rt, g::String, runresult_fn)
+    ug = uppercase(g)
+    v = get(rt.world.observer.globals, ug, nothing)
+    if v !== nothing
+        return Float64(v)
+    end
+    # Not a stored global — evaluate as a reporter expression
+    try
+        result = Base.invokelatest(runresult_fn, rt, g)
+        return Float64(result)
+    catch
+        return 0.0
+    end
+end
+
 function run_julia_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int})
     NetLogo = Base.require(Main, :NetLogo)
     compile_fn = getfield(NetLogo, :compile_model)
@@ -403,31 +464,63 @@ function run_julia_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int
     globals = tracked_globals(model)
     ticks_n = n_ticks(model)
     min_px, max_px, min_py, max_py = world_dims(model)
+    topology_mode = runtime_topology_mode(NetLogo, model)
 
-    compiled = compile_fn(code)
+    compiled = Base.invokelatest(compile_fn, code)
     trajectories = TrajectoryData[]
 
+    # Check if any tracked globals are reporter expressions (not stored globals)
+    # We need runresult for those
+    runresult_fn = nothing
+    try
+        runresult_fn = getfield(NetLogo, :runresult)
+    catch
+    end
+
+    # Create a temp working directory for models that use file I/O
+    tmpdir = mktempdir()
+    setup_files(model, tmpdir)
+    saved_cwd = pwd()
+
+    try
+    cd(tmpdir)
+
     for seed in seeds
-        rt = runtime_fn(compiled; seed=seed,
+        rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
                         min_pxcor=min_px, max_pxcor=max_px,
-                        min_pycor=min_py, max_pycor=max_py)
-        call_fn(rt, "setup")
+                        min_pycor=min_py, max_pycor=max_py,
+                        topology=topology_mode)
+        Base.invokelatest(call_fn, rt, "setup")
 
         tick_nums = Int[0]
         vals = Dict{String, Vector{Float64}}(
-            g => Float64[Float64(get(rt.world.observer.globals, uppercase(g), 0.0))]
+            g => Float64[_read_tracked_global(rt, g, runresult_fn)]
             for g in globals)
 
         for t in 1:ticks_n
-            call_fn(rt, "go")
+            stopped = Base.invokelatest(call_fn, rt, "go")
             push!(tick_nums, t)
             for g in globals
-                v = get(rt.world.observer.globals, uppercase(g), 0.0)
-                push!(vals[g], Float64(v))
+                push!(vals[g], _read_tracked_global(rt, g, runresult_fn))
+            end
+            if stopped === true
+                # Model called stop — fill remaining ticks with final values
+                for t2 in (t+1):ticks_n
+                    push!(tick_nums, t2)
+                    for g in globals
+                        push!(vals[g], last(vals[g]))
+                    end
+                end
+                break
             end
         end
 
         push!(trajectories, TrajectoryData(seed, tick_nums, vals))
+    end
+
+    finally
+        cd(saved_cwd)
+        rm(tmpdir; recursive=true, force=true)
     end
 
     trajectories
@@ -443,6 +536,9 @@ function run_java_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int}
     tmpdir = mktempdir()
     nlogo_path = joinpath(tmpdir, "benchmark.nlogo")
     table_path = joinpath(tmpdir, "output.csv")
+
+    # Create any auxiliary files the model needs (e.g., CSV data files)
+    setup_files(model, tmpdir)
 
     # Write the .nlogo file with seeds embedded as BehaviorSpace <value> tags
     src = nlogo_source(model)
@@ -714,17 +810,9 @@ function trajectory_mmd(jl::Vector{TrajectoryData}, jv::Vector{TrajectoryData},
     function extract_matrix(trajs)
         rows = Vector{Float64}[]
         for traj in trajs
-            v = get(traj.values, g, Float64[])
-            isempty(v) && continue
-            if length(v) >= T
-                push!(rows, Float64.(v[1:T]))
-            else
-                # Pad with final value (model stopped early)
-                padded = Vector{Float64}(undef, T)
-                padded[1:length(v)] .= v
-                padded[length(v)+1:T] .= v[end]
-                push!(rows, padded)
-            end
+            series = padded_trajectory_series(traj, g, nticks)
+            series === nothing && continue
+            push!(rows, series)
         end
         isempty(rows) && return Matrix{Float64}(undef, 0, 0)
         reduce(vcat, [r' for r in rows])  # m × T
@@ -735,6 +823,21 @@ function trajectory_mmd(jl::Vector{TrajectoryData}, jv::Vector{TrajectoryData},
     mmd_rbf(X, Y; n_perms=n_perms)
 end
 
+function padded_trajectory_series(traj::TrajectoryData, g::String, nticks::Int)
+    values = get(traj.values, g, Float64[])
+    isempty(values) && return nothing
+    limit = nticks + 1
+    series = Vector{Float64}(undef, limit)
+    final_value = Float64(values[min(length(values), length(traj.ticks))])
+    fill!(series, final_value)
+    for (i, tick) in enumerate(traj.ticks)
+        i > length(values) && break
+        0 <= tick <= nticks || continue
+        series[tick + 1] = Float64(values[i])
+    end
+    series
+end
+
 function compute_comparisons(jl::Vector{TrajectoryData}, jv::Vector{TrajectoryData},
                              globals::Vector{String}, nticks::Int)
     comparisons = VariableComparison[]
@@ -743,15 +846,17 @@ function compute_comparisons(jl::Vector{TrajectoryData}, jv::Vector{TrajectoryDa
         jv_by_tick = [Float64[] for _ in 0:nticks]
 
         for traj in jl
-            v = get(traj.values, g, Float64[])
-            for (i, t) in enumerate(traj.ticks)
-                0 <= t <= nticks && push!(jl_by_tick[t+1], i <= length(v) ? v[i] : NaN)
+            series = padded_trajectory_series(traj, g, nticks)
+            series === nothing && continue
+            for t in 0:nticks
+                push!(jl_by_tick[t+1], series[t+1])
             end
         end
         for traj in jv
-            v = get(traj.values, g, Float64[])
-            for (i, t) in enumerate(traj.ticks)
-                0 <= t <= nticks && push!(jv_by_tick[t+1], i <= length(v) ? v[i] : NaN)
+            series = padded_trajectory_series(traj, g, nticks)
+            series === nothing && continue
+            for t in 0:nticks
+                push!(jv_by_tick[t+1], series[t+1])
             end
         end
 
@@ -829,8 +934,13 @@ end
 # ── Reporting ─────────────────────────────────────────────────────────
 
 function verdict(c::VariableComparison)
-    # Deterministic match: both means and stds near-zero diff
-    if c.nmae_mean_traj < 1e-8 && c.mae_mean_traj < 1e-8
+    final_exact =
+        (isnan(c.ks_statistic) || c.ks_statistic < 1e-8) &&
+        (isnan(c.ecdf_corr) || c.ecdf_corr > 0.999999) &&
+        (isnan(c.qq_corr) || c.qq_corr > 0.999999) &&
+        (isnan(c.mmd_pvalue) || c.mmd_pvalue > 0.05)
+    # Deterministic/exact match: trajectory and final distribution agree
+    if c.nmae_mean_traj < 1e-8 && c.mae_mean_traj < 1e-8 && final_exact
         return :exact
     end
     # Strong match: high trajectory correlation + low NMAE + MMD non-significant
@@ -996,9 +1106,10 @@ function batch_metrics(trajs_a::Vector{TrajectoryData}, trajs_b::Vector{Trajecto
     function mean_traj(trajs)
         by_tick = [Float64[] for _ in 0:nticks]
         for traj in trajs
-            v = get(traj.values, g, Float64[])
-            for (i, t) in enumerate(traj.ticks)
-                0 <= t <= nticks && push!(by_tick[t+1], i <= length(v) ? v[i] : NaN)
+            series = padded_trajectory_series(traj, g, nticks)
+            series === nothing && continue
+            for t in 0:nticks
+                push!(by_tick[t+1], series[t+1])
             end
         end
         safe_mean.(by_tick)
@@ -1217,5 +1328,78 @@ include("models/abtgc.jl")
 include("models/evolution_of_norms.jl")
 include("models/lassa_virus.jl")
 include("models/axelrod_cultural.jl")
+include("models/mousetraps.jl")
+include("models/fire_benchmark.jl")
+include("models/dla_simple.jl")
+include("models/boiling.jl")
+include("models/solid_diffusion.jl")
+include("models/flocking.jl")
+include("models/sand.jl")
+include("models/rope.jl")
+include("models/polymer_dynamics.jl")
+include("models/thermostat.jl")
+include("models/crystallization.jl")
+include("models/mimicry.jl")
+
+# Extension-exercising models
+include("models/minority_belief.jl")
+include("models/recruiting.jl")
+include("models/slow_spread.jl")
+include("models/spreading_groups.jl")
+
+# NW extension eval wrappers (modelingcommons)
+include("models/superdiffuser.jl")
+include("models/drug_use.jl")
+include("models/products_market.jl")
+include("models/social_influence.jl")
+include("models/participatory_disinformation.jl")
+include("models/info_diffusion.jl")
+include("models/recruiting_supporters.jl")
+include("models/gis_hillclimber.jl")
+include("models/gis_burkina.jl")
+include("models/rhino_poaching.jl")
+include("models/fake_news.jl")
+
+# Additional extension models (nw, table, rnd)
+include("models/flocking_network.jl")
+include("models/misinformation_sbfc.jl")
+include("models/simple_market.jl")
+include("models/spatial_attitude.jl")
+include("models/contagion_nw.jl")
+include("models/diffusion_network.jl")
+
+# Array/Matrix extension models
+include("models/minimal_sis.jl")
+include("models/cultural_diffusion.jl")
+include("models/sugarscape_culture.jl")
+include("models/competition_learning.jl")
+
+# Table/Array combo + Table models
+include("models/babysitting_coop.jl")
+include("models/wisdom_crowd.jl")
+include("models/fungal_bioremediation.jl")
+
+# nw + bitstring extension model
+include("models/participatory_disinfo.jl")
+
+# matrix + rnd extension model
+include("models/blackbox.jl")
+
+# rnd extension model
+include("models/spatial_opinion.jl")
+include("models/forest_dewdney.jl")
+include("models/social_network_diffusion.jl")
+include("models/drug_use_overdose.jl")
+include("models/recruiting_movement.jl")
+include("models/simple_market_random.jl")
+include("models/csv_population.jl")
+include("models/csv_network_foraging.jl")
+include("models/spreading_bots.jl")
+include("models/disinfo_nw_bitstring.jl")
+include("models/cqin.jl")
+include("models/simple_market_table.jl")
+include("models/sugarscape_sexual.jl")
+include("models/pref_attach_homophily.jl")
+include("models/leonardi_tech_adoption.jl")
 
 end # module

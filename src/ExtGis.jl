@@ -3,16 +3,23 @@ module gis
 using ..NetLogo: PrimitiveRegistry, register_primitive!, REPORTER, COMMAND,
   reporter_syntax, command_syntax,
   StringType, ListType, WildcardType, NumberType, BooleanType,
-  AgentsetType, TurtlesetType, PatchsetType, CommandBlockType, SymbolType,
+  AgentsetType, TurtlesetType, PatchsetType, LinksetType, CommandBlockType, SymbolType,
+  OptionalType,
   LogoRuntimeError, logo_string, Context,
-  World, Turtle, Patch, live_agentset_members,
-  create_turtle!, run_block_for_agents!,
+  World, Turtle, Patch, Link, live_agentset_members,
+  create_turtle!, create_link!, run_block_for_agents!,
   patch_at_coords, set_patch_variable!, patch_variable_value,
   canonical_name
 
 using Shapefile
 using DBFTables
 import Tables
+import Proj
+import LibGEOS
+import GeoJSON
+import GeoInterface as GI
+import GeoFormatTypes as GFT
+import GeometryOps as GO
 
 # ═══════════════════════════════════════════════════════════════════════════
 # GIS Data Types
@@ -24,10 +31,20 @@ struct GisVertex
   y::Float64
 end
 
-"""Represents a coordinate system / projection (simplified stub)."""
+"""Represents a coordinate system / projection backed by Proj.jl."""
 mutable struct GisCoordinateSystem
   prj_text::String    # raw .prj WKT content
   name::String
+  crs::Union{Nothing, Proj.CRS}  # Proj.jl CRS object for reprojection
+end
+
+function GisCoordinateSystem(prj_text::String, name::String)
+  crs = try
+    Proj.CRS(prj_text)
+  catch
+    nothing
+  end
+  GisCoordinateSystem(prj_text, name, crs)
 end
 
 """A single vector feature with geometry and properties."""
@@ -81,6 +98,121 @@ end
 # Global transformation state (per-runtime, stored in observer globals)
 const _TRANSFORM_KEY = "__GIS_TRANSFORM__"
 const _DRAWING_COLOR_KEY = "__GIS_DRAWING_COLOR__"
+const _CRS_KEY = "__GIS_COORDINATE_SYSTEM__"
+const _COVERAGE_MIN_KEY = "__GIS_COVERAGE_MIN__"
+const _COVERAGE_MAX_KEY = "__GIS_COVERAGE_MAX__"
+
+"""Get the current world coordinate system (set via gis:set-coordinate-system)."""
+function _get_world_crs(ctx::Context)::Union{Nothing, GisCoordinateSystem}
+  get(ctx.runtime.world.observer.globals, _CRS_KEY, nothing)
+end
+
+"""Reproject a (x, y) coordinate pair from src_crs to dst_crs using Proj.jl."""
+function _reproject_point(x::Float64, y::Float64, src_crs::GisCoordinateSystem, dst_crs::GisCoordinateSystem)
+  (src_crs.crs === nothing || dst_crs.crs === nothing) && return (x, y)
+  trans = Proj.Transformation(src_crs.crs, dst_crs.crs; always_xy=true)
+  trans(x, y)
+end
+
+"""Reproject all features in a vector dataset from its CRS to dst_crs.
+Modifies vertices in-place by replacing geometry with GisVertex-based representation."""
+function _reproject_dataset!(ds::GisVectorDataset, dst_crs::GisCoordinateSystem)
+  src_crs = ds.coordinate_system
+  src_crs === nothing && return ds
+  (src_crs.crs === nothing || dst_crs.crs === nothing) && return ds
+  # Check if CRSes are the same
+  src_crs.prj_text == dst_crs.prj_text && return ds
+  trans = try
+    Proj.Transformation(src_crs.crs, dst_crs.crs; always_xy=true)
+  catch
+    return ds
+  end
+  for f in ds.features
+    _reproject_feature_vertices!(f, trans)
+  end
+  # Update dataset envelope
+  ds.envelope = _compute_dataset_envelope(ds.features)
+  ds.coordinate_system = dst_crs
+  ds
+end
+
+function _reproject_feature_vertices!(f::GisVectorFeature, trans)
+  verts = _extract_all_vertices(f.geometry)
+  new_verts = GisVertex[]
+  for v in verts
+    x, y = trans(v.x, v.y)
+    push!(new_verts, GisVertex(x, y))
+  end
+  # Store transformed vertices as the new geometry representation
+  if f.shape_type == :point && length(new_verts) == 1
+    f.geometry = new_verts[1]
+  else
+    f.geometry = _ReProjectedGeometry(f.geometry, new_verts)
+  end
+  f._centroid = nothing
+  f._envelope = nothing
+end
+
+"""Wrapper that pairs the original geometry structure with reprojected vertex coords."""
+struct _ReProjectedGeometry
+  original::Any
+  vertices::Vector{GisVertex}
+end
+
+function _extract_all_vertices(geom)::Vector{GisVertex}
+  verts = GisVertex[]
+  if geom isa GisVertex
+    push!(verts, geom)
+  elseif geom isa Shapefile.Point || geom isa Shapefile.PointM || geom isa Shapefile.PointZ
+    push!(verts, GisVertex(Float64(geom.x), Float64(geom.y)))
+  elseif geom isa _ReProjectedGeometry
+    return geom.vertices
+  elseif geom isa _GeoJSONGeometry
+    return geom.vertices
+  elseif hasproperty(geom, :points)
+    for p in geom.points
+      push!(verts, GisVertex(Float64(p.x), Float64(p.y)))
+    end
+  end
+  verts
+end
+
+function _compute_dataset_envelope(features::Vector{GisVectorFeature})
+  xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+  for f in features
+    env = _feature_envelope(f)
+    xmin = min(xmin, env[1]); xmax = max(xmax, env[2])
+    ymin = min(ymin, env[3]); ymax = max(ymax, env[4])
+  end
+  (xmin, xmax, ymin, ymax)
+end
+
+"""Reproject a raster dataset. Reprojects envelope corners only (no re-gridding)."""
+function _reproject_raster_envelope!(ds::GisRasterDataset, dst_crs::GisCoordinateSystem)
+  src_crs = ds.coordinate_system
+  src_crs === nothing && return ds
+  (src_crs.crs === nothing || dst_crs.crs === nothing) && return ds
+  src_crs.prj_text == dst_crs.prj_text && return ds
+  trans = try
+    Proj.Transformation(src_crs.crs, dst_crs.crs; always_xy=true)
+  catch
+    return ds
+  end
+  xmin, xmax, ymin, ymax = ds.envelope
+  x1, y1 = trans(xmin, ymin)
+  x2, y2 = trans(xmax, ymin)
+  x3, y3 = trans(xmax, ymax)
+  x4, y4 = trans(xmin, ymax)
+  new_xmin = min(x1, x2, x3, x4)
+  new_xmax = max(x1, x2, x3, x4)
+  new_ymin = min(y1, y2, y3, y4)
+  new_ymax = max(y1, y2, y3, y4)
+  ds.envelope = (new_xmin, new_xmax, new_ymin, new_ymax)
+  ds.cellsize_x = (new_xmax - new_xmin) / ds.width
+  ds.cellsize_y = (new_ymax - new_ymin) / ds.height
+  ds.coordinate_system = dst_crs
+  ds
+end
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Geometry Utilities
@@ -113,7 +245,17 @@ function _all_points(geom)
 end
 
 function _collect_points!(pts, geom)
-  if hasproperty(geom, :x) && hasproperty(geom, :y)
+  if geom isa _ReProjectedGeometry
+    for v in geom.vertices
+      push!(pts, (v.x, v.y))
+    end
+  elseif geom isa _GeoJSONGeometry
+    for v in geom.vertices
+      push!(pts, (v.x, v.y))
+    end
+  elseif geom isa GisVertex
+    push!(pts, (geom.x, geom.y))
+  elseif hasproperty(geom, :x) && hasproperty(geom, :y)
     push!(pts, (Float64(geom.x), Float64(geom.y)))
   elseif hasproperty(geom, :points)
     for p in geom.points
@@ -152,14 +294,7 @@ function _feature_centroid(feat::GisVectorFeature)
   if feat._centroid !== nothing
     return feat._centroid
   end
-  pts = _all_points(feat.geometry)
-  if isempty(pts)
-    c = GisVertex(0.0, 0.0)
-  else
-    cx = sum(p[1] for p in pts) / length(pts)
-    cy = sum(p[2] for p in pts) / length(pts)
-    c = GisVertex(cx, cy)
-  end
+  c = _feature_centroid_geos(feat)
   feat._centroid = c
   c
 end
@@ -186,7 +321,60 @@ end
 """Extract polygon rings as vectors of (x,y) tuples."""
 function _polygon_rings(geom)::Vector{Vector{Tuple{Float64, Float64}}}
   rings = Vector{Tuple{Float64, Float64}}[]
-  if hasproperty(geom, :points)
+  if geom isa _GeoJSONGeometry
+    # Use GeoInterface to get proper ring structure
+    gi_geom = geom.gi_geom
+    trait = GI.geomtrait(gi_geom)
+    if trait isa GI.PolygonTrait
+      for ring_gi in GI.getring(gi_geom)
+        ring = Tuple{Float64, Float64}[]
+        for pt in GI.getpoint(ring_gi)
+          coords = GI.coordinates(pt)
+          push!(ring, (Float64(coords[1]), Float64(coords[2])))
+        end
+        push!(rings, ring)
+      end
+    elseif trait isa GI.MultiPolygonTrait
+      for poly in GI.getgeom(gi_geom)
+        for ring_gi in GI.getring(poly)
+          ring = Tuple{Float64, Float64}[]
+          for pt in GI.getpoint(ring_gi)
+            coords = GI.coordinates(pt)
+            push!(ring, (Float64(coords[1]), Float64(coords[2])))
+          end
+          push!(rings, ring)
+        end
+      end
+    elseif trait isa GI.LineStringTrait || trait isa GI.MultiLineStringTrait
+      # Treat lines as open rings for compatibility
+      ring = Tuple{Float64, Float64}[(v.x, v.y) for v in geom.vertices]
+      push!(rings, ring)
+    else
+      ring = Tuple{Float64, Float64}[(v.x, v.y) for v in geom.vertices]
+      push!(rings, ring)
+    end
+  elseif geom isa _ReProjectedGeometry
+    # For reprojected geometries, build rings from the transformed vertices
+    # using the original geometry's structure for ring boundaries
+    orig = geom.original
+    verts = geom.vertices
+    if hasproperty(orig, :points) && hasproperty(orig, :parts)
+      parts = orig.parts
+      npts = length(verts)
+      for (pi, start_idx) in enumerate(parts)
+        end_idx = pi < length(parts) ? parts[pi + 1] - 1 : npts - 1
+        ring = Tuple{Float64, Float64}[]
+        for i in (start_idx + 1):(end_idx + 1)
+          i <= length(verts) || continue
+          push!(ring, (verts[i].x, verts[i].y))
+        end
+        push!(rings, ring)
+      end
+    else
+      ring = Tuple{Float64, Float64}[(v.x, v.y) for v in verts]
+      push!(rings, ring)
+    end
+  elseif hasproperty(geom, :points)
     ring = Tuple{Float64, Float64}[]
     for p in geom.points
       push!(ring, (Float64(p.x), Float64(p.y)))
@@ -244,11 +432,124 @@ function _feature_contains_point(feat::GisVectorFeature, px::Float64, py::Float6
   end
 end
 
-"""Test if two features intersect (envelope-based approximation + point-in-polygon for polygons)."""
+"""Test if two features intersect using LibGEOS for accurate results."""
 function _features_intersect(feat1, feat2)
   e1 = _get_envelope(feat1)
   e2 = _get_envelope(feat2)
-  _envelopes_intersect(e1, e2)
+  _envelopes_intersect(e1, e2) || return false
+  # Use LibGEOS for precise intersection test
+  g1 = _to_libgeos(feat1)
+  g2 = _to_libgeos(feat2)
+  (g1 === nothing || g2 === nothing) && return true  # fallback to envelope test
+  LibGEOS.intersects(g1, g2)
+end
+
+"""Test if feat1 contains feat2 using LibGEOS."""
+function _feature_contains(feat1, feat2)
+  g1 = _to_libgeos(feat1)
+  g2 = _to_libgeos(feat2)
+  (g1 === nothing || g2 === nothing) && return false
+  LibGEOS.contains(g1, g2)
+end
+
+"""Compute DE-9IM relationship between two features using LibGEOS."""
+function _feature_relationship(feat1, feat2)::String
+  g1 = _to_libgeos(feat1)
+  g2 = _to_libgeos(feat2)
+  (g1 === nothing || g2 === nothing) && return "FFFFFFFFF"
+  ctx = LibGEOS.get_global_context()
+  LibGEOS.GEOSRelate_r(ctx, g1.ptr, g2.ptr)
+end
+
+"""Test DE-9IM pattern match between two features."""
+function _feature_relate_pattern(feat1, feat2, pattern::String)::Bool
+  g1 = _to_libgeos(feat1)
+  g2 = _to_libgeos(feat2)
+  (g1 === nothing || g2 === nothing) && return false
+  ctx = LibGEOS.get_global_context()
+  LibGEOS.GEOSRelatePattern_r(ctx, g1.ptr, g2.ptr, pattern) == 1
+end
+
+"""Convert a GIS feature to a LibGEOS geometry."""
+function _to_libgeos(obj)
+  if obj isa GisVectorFeature
+    return _feature_to_libgeos(obj)
+  elseif obj isa GisVectorDataset
+    # Convert dataset envelope to a rectangle
+    env = obj.envelope
+    return _envelope_to_libgeos(env)
+  elseif obj isa GisRasterDataset
+    env = obj.envelope
+    return _envelope_to_libgeos(env)
+  elseif obj isa NTuple{4, Float64}
+    return _envelope_to_libgeos(obj)
+  end
+  nothing
+end
+
+function _envelope_to_libgeos(env::NTuple{4, Float64})
+  xmin, xmax, ymin, ymax = env
+  LibGEOS.readgeom("POLYGON(($xmin $ymin, $xmax $ymin, $xmax $ymax, $xmin $ymax, $xmin $ymin))")
+end
+
+function _feature_to_libgeos(feat::GisVectorFeature)
+  pts = _all_points(feat.geometry)
+  isempty(pts) && return nothing
+  if feat.shape_type == :point
+    length(pts) == 1 && return LibGEOS.readgeom("POINT($(pts[1][1]) $(pts[1][2]))")
+    wkt = "MULTIPOINT(" * join(["($(p[1]) $(p[2]))" for p in pts], ", ") * ")"
+    return LibGEOS.readgeom(wkt)
+  elseif feat.shape_type == :line
+    if length(pts) < 2
+      return nothing
+    end
+    rings = _polygon_rings(feat.geometry)  # reuse for line parts
+    if length(rings) == 1
+      wkt = "LINESTRING(" * join(["$(p[1]) $(p[2])" for p in rings[1]], ", ") * ")"
+    else
+      parts = ["(" * join(["$(p[1]) $(p[2])" for p in r], ", ") * ")" for r in rings if length(r) >= 2]
+      isempty(parts) && return nothing
+      wkt = "MULTILINESTRING(" * join(parts, ", ") * ")"
+    end
+    return LibGEOS.readgeom(wkt)
+  elseif feat.shape_type == :polygon
+    rings = _polygon_rings(feat.geometry)
+    isempty(rings) && return nothing
+    # First ring is outer, rest are holes
+    parts = String[]
+    for ring in rings
+      length(ring) < 3 && continue
+      # Ensure ring is closed
+      r = ring
+      if r[1] != r[end]
+        r = vcat(r, [r[1]])
+      end
+      push!(parts, "(" * join(["$(p[1]) $(p[2])" for p in r], ", ") * ")")
+    end
+    isempty(parts) && return nothing
+    wkt = "POLYGON(" * join(parts, ", ") * ")"
+    return try
+      LibGEOS.readgeom(wkt)
+    catch
+      nothing
+    end
+  end
+  nothing
+end
+
+"""Compute proper centroid using LibGEOS (true centroid, not vertex average)."""
+function _feature_centroid_geos(feat::GisVectorFeature)
+  g = _feature_to_libgeos(feat)
+  if g !== nothing
+    c = LibGEOS.centroid(g)
+    x = LibGEOS.getGeomX(c)
+    y = LibGEOS.getGeomY(c)
+    return GisVertex(x, y)
+  end
+  # Fallback to vertex average
+  pts = _all_points(feat.geometry)
+  isempty(pts) && return GisVertex(0.0, 0.0)
+  GisVertex(sum(p[1] for p in pts) / length(pts), sum(p[2] for p in pts) / length(pts))
 end
 
 function _get_envelope(obj)
@@ -422,7 +723,111 @@ function _load_ascii_grid(filepath::String)::GisRasterDataset
   ymax = yllcorner + nrows * cellsize
 
   GisRasterDataset(data, ncols, nrows, nodata, (xmin, xmax, ymin, ymax),
-    cellsize, cellsize, :nearest, nothing)
+    cellsize, cellsize, :bilinear, nothing)
+end
+
+"""Load a GeoJSON file and return a GisVectorDataset."""
+function _load_geojson(filepath::String)::GisVectorDataset
+  geojson_text = read(filepath, String)
+  fc = GeoJSON.read(geojson_text)
+
+  features = GisVectorFeature[]
+  property_names_set = Set{String}()
+  xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+  detected_type = :point
+
+  for feat_gi in GI.getfeature(fc)
+    geom_gi = GI.geometry(feat_gi)
+    geom_gi === nothing && continue
+
+    # Determine shape type
+    geom_trait = GI.geomtrait(geom_gi)
+    shape_type = if geom_trait isa GI.PointTrait || geom_trait isa GI.MultiPointTrait
+      :point
+    elseif geom_trait isa GI.LineStringTrait || geom_trait isa GI.MultiLineStringTrait
+      :line
+    elseif geom_trait isa GI.PolygonTrait || geom_trait isa GI.MultiPolygonTrait
+      :polygon
+    else
+      :polygon
+    end
+    detected_type = shape_type
+
+    # Convert geometry to our GisVertex-based representation
+    vertices = GisVertex[]
+    _collect_gi_vertices!(vertices, geom_gi)
+
+    geom = if shape_type == :point && length(vertices) == 1
+      vertices[1]
+    else
+      _GeoJSONGeometry(geom_gi, vertices)
+    end
+
+    # Extract properties
+    props = Dict{String, Any}()
+    if hasproperty(feat_gi, :properties)
+      for (k, v) in pairs(GI.properties(feat_gi))
+        key = String(k)
+        props[key] = v === nothing ? "" : v
+        push!(property_names_set, key)
+      end
+    end
+
+    gf = GisVectorFeature(geom, shape_type, props)
+    env = _feature_envelope(gf)
+    xmin = min(xmin, env[1]); xmax = max(xmax, env[2])
+    ymin = min(ymin, env[3]); ymax = max(ymax, env[4])
+    push!(features, gf)
+  end
+
+  envelope = isempty(features) ? (0.0, 0.0, 0.0, 0.0) : (xmin, xmax, ymin, ymax)
+  prop_names = sort(collect(property_names_set))
+
+  # GeoJSON is always WGS84 (EPSG:4326) by specification
+  coord_sys = GisCoordinateSystem(
+    "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]",
+    "WGS_84"
+  )
+
+  GisVectorDataset(features, prop_names, detected_type, envelope, coord_sys)
+end
+
+"""Wrapper for GeoJSON geometry preserving both GeoInterface geometry and extracted vertices."""
+struct _GeoJSONGeometry
+  gi_geom::Any
+  vertices::Vector{GisVertex}
+end
+
+function _collect_gi_vertices!(verts::Vector{GisVertex}, geom)
+  trait = GI.geomtrait(geom)
+  if trait isa GI.PointTrait
+    coords = GI.coordinates(geom)
+    push!(verts, GisVertex(Float64(coords[1]), Float64(coords[2])))
+  elseif trait isa GI.MultiPointTrait
+    for pt in GI.getpoint(geom)
+      _collect_gi_vertices!(verts, pt)
+    end
+  elseif trait isa GI.LineStringTrait
+    for pt in GI.getpoint(geom)
+      coords = GI.coordinates(pt)
+      push!(verts, GisVertex(Float64(coords[1]), Float64(coords[2])))
+    end
+  elseif trait isa GI.MultiLineStringTrait
+    for line in GI.getgeom(geom)
+      _collect_gi_vertices!(verts, line)
+    end
+  elseif trait isa GI.PolygonTrait
+    for ring in GI.getring(geom)
+      for pt in GI.getpoint(ring)
+        coords = GI.coordinates(pt)
+        push!(verts, GisVertex(Float64(coords[1]), Float64(coords[2])))
+      end
+    end
+  elseif trait isa GI.MultiPolygonTrait
+    for poly in GI.getgeom(geom)
+      _collect_gi_vertices!(verts, poly)
+    end
+  end
 end
 
 function _load_dataset(filepath::String)
@@ -431,8 +836,10 @@ function _load_dataset(filepath::String)
     return _load_shapefile(filepath)
   elseif ext in (".asc", ".grd", ".txt")
     return _load_ascii_grid(filepath)
+  elseif ext in (".geojson", ".json")
+    return _load_geojson(filepath)
   else
-    throw(LogoRuntimeError("gis:load-dataset: unsupported file type '$ext'. Supported: .shp, .asc, .grd"))
+    throw(LogoRuntimeError("gis:load-dataset: unsupported file type '$ext'. Supported: .shp, .asc, .grd, .geojson, .json"))
   end
 end
 
@@ -599,7 +1006,22 @@ function register_extension!(registry::PrimitiveRegistry)
   register_primitive!(registry, "GIS:SET-COORDINATE-SYSTEM", COMMAND,
     command_syntax(right=[WildcardType]),
     (ctx, args) -> begin
-      # Stub: store but don't transform (no reprojection engine yet)
+      arg = args[1]
+      crs = if arg isa GisCoordinateSystem
+        arg
+      elseif arg isa AbstractString
+        prj = String(arg)
+        # Support well-known CRS names like "WGS_84_Geographic" or EPSG codes
+        if startswith(prj, "GEOGCS") || startswith(prj, "PROJCS")
+          GisCoordinateSystem(prj, "custom")
+        else
+          # Try as Proj string or EPSG code
+          GisCoordinateSystem(prj, prj)
+        end
+      else
+        throw(LogoRuntimeError("gis:set-coordinate-system expected a coordinate system or WKT string"))
+      end
+      ctx.runtime.world.observer.globals[_CRS_KEY] = crs
       nothing
     end)
 
@@ -865,7 +1287,7 @@ function register_extension!(registry::PrimitiveRegistry)
 
   # ── Coverage Application ───────────────────────────────────────────────
   register_primitive!(registry, "GIS:APPLY-COVERAGE", COMMAND,
-    command_syntax(right=[WildcardType, StringType, StringType]),
+    command_syntax(right=[WildcardType, SymbolType, SymbolType], arg_modes=[:eval, :symbol, :symbol]),
     (ctx, args) -> begin
       ds = args[1]
       ds isa GisVectorDataset || throw(LogoRuntimeError("gis:apply-coverage expected a vector dataset"))
@@ -969,7 +1391,7 @@ function register_extension!(registry::PrimitiveRegistry)
     end)
 
   register_primitive!(registry, "GIS:APPLY-RASTER", COMMAND,
-    command_syntax(right=[WildcardType, StringType]),
+    command_syntax(right=[WildcardType, SymbolType], arg_modes=[:eval, :symbol]),
     (ctx, args) -> begin
       r = args[1]
       r isa GisRasterDataset || throw(LogoRuntimeError("Expected raster dataset"))
@@ -977,11 +1399,32 @@ function register_extension!(registry::PrimitiveRegistry)
     end)
 
   register_primitive!(registry, "GIS:RASTER-SAMPLE", REPORTER,
-    reporter_syntax(right=[WildcardType, NumberType, NumberType], ret=NumberType),
+    reporter_syntax(right=[WildcardType, WildcardType, NumberType | OptionalType], ret=NumberType),
     (ctx, args) -> begin
       r = args[1]
       r isa GisRasterDataset || throw(LogoRuntimeError("Expected raster dataset"))
-      val = _sample_raster(r, Float64(args[2]), Float64(args[3]))
+      local gx::Float64, gy::Float64
+      if length(args) >= 3 && args[2] isa Number
+        gx = Float64(args[2]); gy = Float64(args[3])
+      else
+        # args[2] is an agent (turtle or patch) — extract world coordinates and convert to GIS
+        agent = args[2]
+        local nx::Float64, ny::Float64
+        if agent isa Turtle
+          nx = agent.xcor; ny = agent.ycor
+        elseif agent isa Patch
+          nx = Float64(agent.pxcor); ny = Float64(agent.pycor)
+        else
+          throw(LogoRuntimeError("gis:raster-sample expected coordinates or an agent"))
+        end
+        transform = _get_transform(ctx)
+        if transform !== nothing
+          gx, gy = _netlogo_to_gis(transform, nx, ny)
+        else
+          gx = nx; gy = ny
+        end
+      end
+      val = _sample_raster(r, gx, gy)
       val === nothing ? Float64(r.nodata) : Float64(val)
     end)
 
@@ -1003,7 +1446,7 @@ function register_extension!(registry::PrimitiveRegistry)
       envelope = (Float64(env[1]), Float64(env[2]), Float64(env[3]), Float64(env[4]))
       cx = (envelope[2] - envelope[1]) / w
       cy = (envelope[4] - envelope[3]) / h
-      GisRasterDataset(data, w, h, -9999.0, envelope, cx, cy, :nearest, nothing)
+      GisRasterDataset(data, w, h, -9999.0, envelope, cx, cy, :bilinear, nothing)
     end)
 
   register_primitive!(registry, "GIS:RESAMPLE", REPORTER,
@@ -1028,12 +1471,14 @@ function register_extension!(registry::PrimitiveRegistry)
     end)
 
   register_primitive!(registry, "GIS:CONVOLVE", REPORTER,
-    reporter_syntax(right=[WildcardType, NumberType, NumberType, ListType], ret=WildcardType),
+    reporter_syntax(right=[WildcardType, NumberType, NumberType, ListType, NumberType | OptionalType, NumberType | OptionalType], ret=WildcardType),
     (ctx, args) -> begin
       src = args[1]
       src isa GisRasterDataset || throw(LogoRuntimeError("Expected raster dataset"))
       kw = Int(args[2]); kh = Int(args[3])
       kernel_flat = args[4]
+      h_scale = length(args) >= 5 ? Float64(args[5]) : 1.0
+      v_scale = length(args) >= 6 ? Float64(args[6]) : 1.0
       length(kernel_flat) == kw * kh || throw(LogoRuntimeError("Kernel size mismatch"))
       kernel = reshape(Float64[Float64(v) for v in kernel_flat], kh, kw)
       new_data = fill(src.nodata, src.height, src.width)
@@ -1049,7 +1494,7 @@ function register_extension!(registry::PrimitiveRegistry)
             weight += k
           end
         end
-        new_data[r, c] = weight != 0.0 ? total / weight : 0.0
+        new_data[r, c] = total * h_scale * v_scale
       end
       GisRasterDataset(new_data, src.width, src.height, src.nodata, src.envelope,
         src.cellsize_x, src.cellsize_y, src.sampling_method, src.coordinate_system)
@@ -1085,8 +1530,7 @@ function register_extension!(registry::PrimitiveRegistry)
       if outer isa GisVectorFeature && inner isa GisVertex
         return _feature_contains_point(outer, inner.x, inner.y)
       end
-      e1 = _get_envelope(outer); e2 = _get_envelope(inner)
-      e1[1] <= e2[1] && e1[2] >= e2[2] && e1[3] <= e2[3] && e1[4] >= e2[4]
+      _feature_contains(outer, inner)
     end)
 
   register_primitive!(registry, "GIS:CONTAINED-BY?", REPORTER,
@@ -1096,54 +1540,41 @@ function register_extension!(registry::PrimitiveRegistry)
       if outer isa GisVectorFeature && inner isa GisVertex
         return _feature_contains_point(outer, inner.x, inner.y)
       end
-      e1 = _get_envelope(inner); e2 = _get_envelope(outer)
-      e2[1] <= e1[1] && e2[2] >= e1[2] && e2[3] <= e1[3] && e2[4] >= e1[4]
+      _feature_contains(outer, inner)
     end)
 
   register_primitive!(registry, "GIS:HAVE-RELATIONSHIP?", REPORTER,
     reporter_syntax(right=[WildcardType, WildcardType, StringType], ret=BooleanType),
-    (ctx, args) -> begin
-      rel = lowercase(String(args[3]))
-      if rel == "intersects"
-        return _features_intersect(args[1], args[2])
-      elseif rel == "contains"
-        e1 = _get_envelope(args[1]); e2 = _get_envelope(args[2])
-        return e1[1] <= e2[1] && e1[2] >= e2[2] && e1[3] <= e2[3] && e1[4] >= e2[4]
-      elseif rel == "covered-by"
-        e1 = _get_envelope(args[1]); e2 = _get_envelope(args[2])
-        return e2[1] <= e1[1] && e2[2] >= e1[2] && e2[3] <= e1[3] && e2[4] >= e1[4]
-      end
-      false
-    end)
+    (ctx, args) -> _feature_relate_pattern(args[1], args[2], String(args[3])))
 
   register_primitive!(registry, "GIS:RELATIONSHIP-OF", REPORTER,
     reporter_syntax(right=[WildcardType, WildcardType], ret=StringType),
-    (ctx, args) -> begin
-      intersects = _features_intersect(args[1], args[2])
-      intersects ? "INTERSECTS" : "DISJOINT"
-    end)
+    (ctx, args) -> _feature_relationship(args[1], args[2]))
 
   register_primitive!(registry, "GIS:INTERSECTING", REPORTER,
     reporter_syntax(right=[AgentsetType, WildcardType], ret=AgentsetType),
     (ctx, args) -> begin
-      # Simplified: filter agents whose patch envelope overlaps the geometry envelope
       agents = args[1]
-      geom_env = _get_envelope(args[2])
+      geom_obj = args[2]
       t = _get_transform(ctx)
       t === nothing && throw(LogoRuntimeError("No GIS transformation set"))
+      geom_env = _get_envelope(geom_obj)
+      geos_geom = _to_libgeos(geom_obj)
       matching = Any[]
       for agent in live_agentset_members(agents)
-        if agent isa Turtle
-          gx, gy = _netlogo_to_gis(t, Float64(agent.xcor), Float64(agent.ycor))
-          if _envelope_contains_point(geom_env, gx, gy)
-            push!(matching, agent)
-          end
+        gx, gy = if agent isa Turtle
+          _netlogo_to_gis(t, Float64(agent.xcor), Float64(agent.ycor))
         elseif agent isa Patch
-          gx, gy = _netlogo_to_gis(t, Float64(agent.pxcor), Float64(agent.pycor))
-          if _envelope_contains_point(geom_env, gx, gy)
-            push!(matching, agent)
-          end
+          _netlogo_to_gis(t, Float64(agent.pxcor), Float64(agent.pycor))
+        else
+          continue
         end
+        _envelope_contains_point(geom_env, gx, gy) || continue
+        if geos_geom !== nothing
+          pt = LibGEOS.readgeom("POINT($gx $gy)")
+          LibGEOS.intersects(geos_geom, pt) || continue
+        end
+        push!(matching, agent)
       end
       matching
     end)
@@ -1193,8 +1624,10 @@ function register_extension!(registry::PrimitiveRegistry)
           gx, gy = Float64(turtle.xcor), Float64(turtle.ycor)
         end
         geom = GisVertex(gx, gy)
-        props = Dict{String, Any}("WHO" => Float64(turtle.who))
-        push!(features, GisVectorFeature(geom, :point, props))
+        props = Dict{String, Any}("WHO" => Float64(turtle.id))
+        feat = GisVectorFeature(geom, :point, props)
+        feat._centroid = geom
+        push!(features, feat)
       end
       env = if isempty(features)
         (0.0, 0.0, 0.0, 0.0)
@@ -1240,6 +1673,85 @@ function register_extension!(registry::PrimitiveRegistry)
         (minimum(xs), maximum(xs), minimum(ys), maximum(ys))
       end
       GisVectorDataset(features, ["PXCOR", "PYCOR", "PCOLOR"], :polygon, env, nothing)
+    end)
+
+  # ── Link Dataset Creation ────────────────────────────────────────────
+  register_primitive!(registry, "GIS:LINK-DATASET", REPORTER,
+    reporter_syntax(right=[LinksetType], ret=WildcardType),
+    (ctx, args) -> begin
+      t = _get_transform(ctx)
+      links = live_agentset_members(args[1])
+      features = GisVectorFeature[]
+      world = ctx.runtime.world
+      for link in links
+        link isa Link || continue
+        link.alive || continue
+        t1 = get(world.turtles, link.end1, nothing)
+        t2 = get(world.turtles, link.end2, nothing)
+        (t1 === nothing || t2 === nothing) && continue
+        (!t1.alive || !t2.alive) && continue
+        if t !== nothing
+          gx1, gy1 = _netlogo_to_gis(t, Float64(t1.xcor), Float64(t1.ycor))
+          gx2, gy2 = _netlogo_to_gis(t, Float64(t2.xcor), Float64(t2.ycor))
+        else
+          gx1, gy1 = Float64(t1.xcor), Float64(t1.ycor)
+          gx2, gy2 = Float64(t2.xcor), Float64(t2.ycor)
+        end
+        verts = [GisVertex(gx1, gy1), GisVertex(gx2, gy2)]
+        props = Dict{String, Any}("END1" => Float64(link.end1), "END2" => Float64(link.end2))
+        feat = GisVectorFeature(_ReProjectedGeometry(nothing, verts), :line, props)
+        push!(features, feat)
+      end
+      env = if isempty(features)
+        (0.0, 0.0, 0.0, 0.0)
+      else
+        _compute_dataset_envelope(features)
+      end
+      GisVectorDataset(features, ["END1", "END2"], :line, env, nothing)
+    end)
+
+  # ── Create Turtles from Points ──────────────────────────────────────
+  register_primitive!(registry, "GIS:CREATE-TURTLES-FROM-POINTS", COMMAND,
+    command_syntax(right=[WildcardType, StringType, CommandBlockType | OptionalType],
+                   arg_modes=[:eval, :eval, :block]),
+    (ctx, args) -> begin
+      ds = args[1]
+      ds isa GisVectorDataset || throw(LogoRuntimeError("gis:create-turtles-from-points expected a vector dataset"))
+      ds.shape_type == :point || throw(LogoRuntimeError("gis:create-turtles-from-points expected a point dataset"))
+      breed_name = canonical_name(String(args[2]))
+      cmd_block = get(args, 3, nothing)
+      t = _get_transform(ctx)
+      t === nothing && throw(LogoRuntimeError("No GIS transformation set"))
+      world = ctx.runtime.world
+      new_turtles = Any[]
+      for feat in ds.features
+        centroid = _feature_centroid(feat)
+        nx, ny = _gis_to_netlogo(t, centroid.x, centroid.y)
+        turtle = create_turtle!(world; xcor=nx, ycor=ny)
+        push!(new_turtles, turtle)
+      end
+      if cmd_block isa BlockNode
+        run_block_for_agents!(ctx, new_turtles, cmd_block)
+      end
+      nothing
+    end)
+
+  # ── Lat/Lon Projection ─────────────────────────────────────────────
+  register_primitive!(registry, "GIS:PROJECT-LAT-LON", REPORTER,
+    reporter_syntax(right=[NumberType, NumberType], ret=ListType),
+    (ctx, args) -> begin
+      lat = Float64(args[1])
+      lon = Float64(args[2])
+      world_crs = _get_world_crs(ctx)
+      if world_crs !== nothing && world_crs.crs !== nothing
+        # Transform from WGS84 lat/lon to the world coordinate system
+        wgs84 = Proj.CRS("EPSG:4326")
+        trans = Proj.Transformation(wgs84, world_crs.crs; always_xy=true)
+        x, y = trans(lon, lat)
+        return Any[x, y]
+      end
+      # No world CRS set; return lat/lon as-is
+      Any[lon, lat]
     end)
 
 end # register_extension!

@@ -51,6 +51,7 @@ struct PrimitiveSyntax
   agent_classes::String
   arg_modes::Vector{Symbol}
   introduces_context::Bool
+  default_count::Int  # number of args to consume in non-parenthesized form (-1 = no limit)
 end
 
 function command_syntax(;
@@ -58,8 +59,10 @@ function command_syntax(;
   precedence::Int=CommandPrecedence,
   agent_classes::String="OTPL",
   arg_modes::Vector{Symbol}=fill(:eval, length(right)),
-  introduces_context::Bool=false)
-  PrimitiveSyntax(VoidType, right, VoidType, precedence, agent_classes, arg_modes, introduces_context)
+  introduces_context::Bool=false,
+  default_count::Int=-1)
+  PrimitiveSyntax(VoidType, right, VoidType, precedence, agent_classes, arg_modes, introduces_context,
+    default_count)
 end
 
 function reporter_syntax(;
@@ -68,16 +71,41 @@ function reporter_syntax(;
   ret::Int=WildcardType,
   precedence::Int=NormalPrecedence,
   agent_classes::String="OTPL",
-  arg_modes::Vector{Symbol}=fill(:eval, length(right)))
-  PrimitiveSyntax(left, right, ret, precedence, agent_classes, arg_modes, false)
+  arg_modes::Vector{Symbol}=fill(:eval, length(right)),
+  default_count::Int=-1)
+  PrimitiveSyntax(left, right, ret, precedence, agent_classes, arg_modes, false,
+    default_count)
 end
 
-struct PrimitiveSpec
+function primitive_modes(syntax::PrimitiveSyntax)
+  modes = Symbol[]
+  if syntax.left != VoidType
+    push!(modes, effective_arg_mode(syntax.left, :eval))
+  end
+  for (index, mask) in enumerate(syntax.right)
+    fallback = index <= length(syntax.arg_modes) ? syntax.arg_modes[index] : :eval
+    push!(modes, effective_arg_mode(mask, fallback))
+  end
+  modes
+end
+
+mutable struct PrimitiveSpec
   name::String
   kind::PrimitiveKind
   syntax::PrimitiveSyntax
   evaluator::Function
+  modes::Vector{Symbol}
+  all_eval_modes::Bool
 end
+
+PrimitiveSpec(
+  name::String,
+  kind::PrimitiveKind,
+  syntax::PrimitiveSyntax,
+  evaluator::Function) =
+  let modes = primitive_modes(syntax)
+    PrimitiveSpec(name, kind, syntax, evaluator, modes, all(mode -> mode == :eval, modes))
+  end
 
 mutable struct PrimitiveRegistry
   commands::Dict{String, PrimitiveSpec}

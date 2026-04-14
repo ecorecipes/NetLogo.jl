@@ -18,7 +18,6 @@ rabbits-own [energy]
 
 to setup
   clear-all
-  random-seed randomSeed
   resize-world (- 20) 20 (- 20) 20
   set number 150
   set birth-threshold 15
@@ -27,7 +26,7 @@ to setup
   set grass-energy 5
   set weed-energy 0
   grow-grass-and-weeds
-  set-default-shape rabbits "rabbit"
+  set-default-shape rabbits "default"
   create-rabbits number [
     set color white
     setxy random-xcor random-ycor

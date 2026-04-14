@@ -233,12 +233,22 @@ end
 
 function register_extension!(registry::PrimitiveRegistry)
 
-  # rnd:weighted-one-of <agentset> [ reporter ]
+  # rnd:weighted-one-of <agentset-or-list> [ reporter ]
   register_primitive!(registry, "RND:WEIGHTED-ONE-OF", REPORTER,
-    reporter_syntax(right=[AgentsetType, NumberBlockType],
-      ret=AgentType | NobodyType,
-      arg_modes=[:eval, :reporter_block]),
-    (ctx, args) -> weighted_one_of_agentset(ctx, args[1], args[2]))
+    reporter_syntax(right=[WildcardType, WildcardType],
+      ret=WildcardType,
+      arg_modes=[:eval, :reporter_task]),
+    (ctx, args) -> begin
+      collection = args[1]
+      task = args[2]
+      if collection isa AgentSet
+        weighted_one_of_agentset(ctx, collection, task)
+      elseif collection isa AbstractVector
+        weighted_one_of_list(ctx, collection, task)
+      else
+        throw(LogoRuntimeError("RND:WEIGHTED-ONE-OF expected an agentset or list, got $(typeof(collection))"))
+      end
+    end)
 
   # rnd:weighted-one-of-list <list> [ [x] -> reporter ]
   register_primitive!(registry, "RND:WEIGHTED-ONE-OF-LIST", REPORTER,
@@ -247,12 +257,22 @@ function register_extension!(registry::PrimitiveRegistry)
       arg_modes=[:eval, :reporter_task]),
     (ctx, args) -> weighted_one_of_list(ctx, args[1], args[2]))
 
-  # rnd:weighted-n-of <n> <agentset> [ reporter ]
+  # rnd:weighted-n-of <n> <agentset-or-list> [ reporter ]
   register_primitive!(registry, "RND:WEIGHTED-N-OF", REPORTER,
-    reporter_syntax(right=[NumberType, AgentsetType, NumberBlockType],
-      ret=AgentsetType,
-      arg_modes=[:eval, :eval, :reporter_block]),
-    (ctx, args) -> weighted_n_of_agentset(ctx, args[1], args[2], args[3]))
+    reporter_syntax(right=[NumberType, WildcardType, WildcardType],
+      ret=WildcardType,
+      arg_modes=[:eval, :eval, :reporter_task]),
+    (ctx, args) -> begin
+      collection = args[2]
+      task = args[3]
+      if collection isa AgentSet
+        weighted_n_of_agentset(ctx, args[1], collection, task)
+      elseif collection isa AbstractVector
+        weighted_n_of_list(ctx, args[1], collection, task)
+      else
+        throw(LogoRuntimeError("RND:WEIGHTED-N-OF expected an agentset or list, got $(typeof(collection))"))
+      end
+    end)
 
   # rnd:weighted-n-of-list <n> <list> [ [x] -> reporter ]
   register_primitive!(registry, "RND:WEIGHTED-N-OF-LIST", REPORTER,

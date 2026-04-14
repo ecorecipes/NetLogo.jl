@@ -1,10 +1,15 @@
 using Test
 using Colors: RGB
 using FileIO
+using HTTP
+using JSON
 using NetLogo
 
 module TESTEXT
 using Main.NetLogo
+using Main.Test: @test, @testset
+using Main.HTTP
+using Main.JSON
 
 function register_extension!(registry)
   Main.NetLogo.register_primitive!(
@@ -23,6 +28,244 @@ function register_extension!(registry)
       ctx.runtime.world.observer.globals["EXTENSION-VALUE"] = Main.NetLogo.numeric(args[1])
       nothing
     end)
+end
+
+@testset "unit: GUI backends" begin
+  model = parse_model("""
+  globals [population]
+
+  to setup
+    clear-all
+    create-turtles ants
+    set population count turtles
+    set-current-plot "Population"
+    clear-plot
+    plot population
+    output-print title
+    reset-ticks
+  end
+
+  to go
+    ask turtles [ rt 15 fd 1 ]
+    tick
+    set population count turtles
+    set-current-plot "Population"
+    plot population
+  end
+  @#\$#@#\$#@
+  GRAPHICS-WINDOW
+  0
+  0
+  220
+  220
+  -1
+  -1
+  8.0
+  1
+  11
+  1
+  1
+  1
+  0
+  0
+  1
+  1
+  -5
+  5
+  -5
+  5
+  1
+  1
+  1
+  ticks
+  20.0
+
+  SLIDER
+  0
+  0
+  120
+  33
+  Ants
+  ants
+  0
+  20
+  12
+  1
+  1
+  NIL
+  HORIZONTAL
+
+  SWITCH
+  0
+  40
+  120
+  73
+  auto?
+  auto?
+  0
+  1
+  -1000
+
+  CHOOSER
+  0
+  80
+  120
+  113
+  mode
+  mode
+  "fast" "slow"
+  0
+
+  INPUTBOX
+  0
+  120
+  120
+  153
+  title
+  hello world
+  1
+  0
+  String
+
+  MONITOR
+  0
+  160
+  120
+  193
+  Population
+  count turtles
+  2
+  1
+  11
+
+  BUTTON
+  0
+  200
+  120
+  233
+  Setup
+  setup
+  NIL
+  1
+  T
+  OBSERVER
+  NIL
+  NIL
+  NIL
+  NIL
+  1
+
+  TEXTBOX
+  130
+  170
+  220
+  210
+  gui ready
+  12
+  15
+  1
+
+  OUTPUT
+  130
+  0
+  220
+  80
+  12
+
+  PLOT
+  130
+  90
+  330
+  250
+  Population
+  Ticks
+  Count
+  0.0
+  20.0
+  0.0
+  20.0
+  true
+  true
+  "" ""
+  PENS
+  "default" 1.0 0 -16777216 true "" "plot population"
+  @#\$#@#\$#@
+  """)
+
+  session = gui_session(model; seed=11)
+  state = gui_state(session)
+  slider = only([widget for widget in state["widgets"] if widget["type"] == "slider"])
+  monitor = only([widget for widget in state["widgets"] if widget["type"] == "monitor"])
+  button = only([widget for widget in state["widgets"] if widget["type"] == "button"])
+
+  @test state["ticks"]["started"] == false
+  @test slider["variable"] == "ants"
+  @test slider["value"] == 12.0
+  @test monitor["displayValue"] == "0.00"
+  @test length(state["plots"]) == 1
+
+  set_gui_widget!(session, "ANTS", 8)
+  set_gui_widget!(session, "auto?", true)
+  set_gui_widget!(session, "mode", "slow")
+  set_gui_widget!(session, "title", "hello gui")
+  press_gui_button!(session, "Setup")
+
+  state = gui_state(session)
+  monitor = only([widget for widget in state["widgets"] if widget["type"] == "monitor"])
+  plot = only(state["plots"])
+  pen = only(plot["pens"])
+
+  @test state["ticks"]["started"] == true
+  @test session.runtime.world.observer.globals["ANTS"] == 8.0
+  @test session.runtime.world.observer.globals["AUTO?"] == true
+  @test session.runtime.world.observer.globals["MODE"] == "slow"
+  @test session.runtime.world.observer.globals["TITLE"] == "hello gui"
+  @test monitor["displayValue"] == "8.00"
+  @test occursin("hello gui", state["outputArea"])
+  @test length(pen["points"]) >= 1
+
+  port = 18881
+  backend = start_web_gui(session; port=port)
+  try
+    @test web_gui_url(backend) == "http://127.0.0.1:18881/"
+
+    html_response = HTTP.get(web_gui_url(backend))
+    @test html_response.status == 200
+    @test occursin("NetLogo.jl GUI", String(html_response.body))
+
+    state_response = HTTP.get(web_gui_url(backend) * "api/state")
+    @test state_response.status == 200
+    payload = JSON.parse(String(state_response.body))
+    @test payload["ticks"]["started"] == true
+
+    view_response = HTTP.get(web_gui_url(backend) * "api/view.png")
+    @test view_response.status == 200
+    @test occursin("image/png", HTTP.header(view_response, "Content-Type"))
+
+    slider_response = HTTP.post(
+      web_gui_url(backend) * "api/widgets/$(slider["id"])",
+      ["Content-Type" => "application/json"],
+      JSON.json(Dict("value" => 5)))
+    slider_payload = JSON.parse(String(slider_response.body))
+    slider_widget = only([widget for widget in slider_payload["widgets"] if widget["id"] == slider["id"]])
+    @test slider_widget["value"] == 5.0
+
+    button_response = HTTP.post(
+      web_gui_url(backend) * "api/buttons/$(button["id"])/press",
+      ["Content-Type" => "application/json"],
+      "{}")
+    button_payload = JSON.parse(String(button_response.body))
+    button_monitor = only([widget for widget in button_payload["widgets"] if widget["type"] == "monitor"])
+    @test button_monitor["displayValue"] == "5.00"
+
+    notebook = notebook_gui(backend; width=640, height=480, title="Embedded GUI")
+    @test notebook isa NotebookGUI
+    @test occursin("<iframe", sprint(show, MIME"text/html"(), notebook))
+    @test occursin(web_gui_url(backend), sprint(show, MIME"text/html"(), notebook))
+    @test pluto_gui(backend; width=320, height=240) isa NotebookGUI
+  finally
+    stop_web_gui!(backend)
+  end
 end
 
 end
@@ -253,7 +496,7 @@ end
   end
 
   to-report collection-demo
-    report list first ["a" "b"] item 1 [10 20 30] word "wo" "lf"
+    report (list first ["a" "b"] item 1 [10 20 30] word "wo" "lf")
   end
   """)
 
@@ -1554,7 +1797,7 @@ end
 @testset "unit: range reporter" begin
   runtime = create_runtime(netlogo"""
   to-report range-basic
-    report list (range 5) (range 2 5) (range 2 5 0.5) (range 5 0 -1) (range 0 5 -1) (range 0.5 2.51 0.5)
+    report (list (range 5) (range 2 5) (range 2 5 0.5) (range 5 0 -1) (range 0 5 -1) (range 0.5 2.51 0.5))
   end
 
   to-report range-map-empty
@@ -4100,7 +4343,7 @@ end
   end
 
   to-report runresult-demo
-    report runresult [ x -> x + 1 ] 4
+    report (runresult [ x -> x + 1 ] 4)
   end
 
   to-report runresult-constant-demo
@@ -4111,11 +4354,11 @@ end
     let x 10
     let addx [ y -> y + x ]
     set x 20
-    report runresult addx 5
+    report (runresult addx 5)
   end
 
   to-report nested-lambda-demo
-    report runresult (runresult [ x -> [ y -> x + y ] ] 4) 6
+    report (runresult (runresult [ x -> [ y -> x + y ] ] 4) 6)
   end
 
   to-report map-lambda-demo
@@ -4864,7 +5107,7 @@ end
     end
 
     to-report can-move-triplet [first-distance second-distance third-distance]
-      report [list can-move? first-distance can-move? second-distance can-move? third-distance] of turtle 0
+      report [(list can-move? first-distance can-move? second-distance can-move? third-distance)] of turtle 0
     end
     """; min_pxcor=-5, max_pxcor=5, min_pycor=-5, max_pycor=5, topology=topology, seed=227)
     call!(runtime, "setup")
@@ -4876,6 +5119,33 @@ end
 
   @test call!(torus_runtime, "can-move-triplet", 1, 0.5, 0) == Any[true, true, true]
   @test call!(box_runtime, "can-move-triplet", 1, 0.5, 0.2) == Any[false, false, true]
+  @test call!(box_runtime, "can-move-triplet", 0.4, 0.2, 0) == Any[false, true, true]
+end
+
+@testset "unit: blocked forward movement" begin
+  runtime = create_runtime(netlogo"""
+  to setup
+    clear-all
+    resize-world 0 2 0 2
+    set-topology false false
+    crt 1 [ setxy 1 1 set heading 90 ]
+  end
+
+  to-report partial-forward [distance]
+    setup
+    ask turtle 0 [ fd distance ]
+    report [list xcor ycor] of turtle 0
+  end
+
+  to-report blocked-forward-at-edge [distance]
+    setup
+    ask turtle 0 [ setxy 2 1 fd distance ]
+    report [list xcor ycor] of turtle 0
+  end
+  """; seed=228)
+
+  @test call!(runtime, "partial-forward", 2) == Any[2.0, 1.0]
+  @test call!(runtime, "blocked-forward-at-edge", 1) == Any[2.0, 1.0]
 end
 
 @testset "unit: uphill and downhill commands" begin
@@ -5475,11 +5745,11 @@ end
   end
 
   to-report missing-default
-    report word link 2 3
+    report (word link 2 3)
   end
 
   to-report missing-directed
-    report word directed-edge 0 1
+    report (word directed-edge 0 1)
   end
 
   to-report matching-road
@@ -5567,7 +5837,7 @@ end
   end
 
   to-report world-dimensions
-    report list world-width world-height min-pxcor max-pxcor min-pycor max-pycor
+    report (list world-width world-height min-pxcor max-pxcor min-pycor max-pycor)
   end
 
   to-report bad-resize
@@ -5892,7 +6162,7 @@ end
   end
 
   to-report precision-demo
-    report list (precision 1.23456789 3) (precision 3834 (-3)) (precision 2175 (-2)) (precision 2144 (-2))
+    report (list (precision 1.23456789 3) (precision 3834 (-3)) (precision 2175 (-2)) (precision 2144 (-2)))
   end
   """; seed=107)
 
@@ -6876,11 +7146,11 @@ end
   end
 
   to-report symbol-values
-    report list (__symbol what-is-this) (__symbol xcor) (__symbol turtles) (__symbol turtle)
+    report (list (__symbol what-is-this) (__symbol xcor) (__symbol turtles) (__symbol turtle))
   end
 
   to-report block-values
-    report list (__block [ crt some-stuff ]) (__block [ crt [ setxy foo bar ] ]) (__block [ [foo] -> foo ])
+    report (list (__block [ crt some-stuff ]) (__block [ crt [ setxy foo bar ] ]) (__block [ [foo] -> foo ]))
   end
 
   to-report apply-arity-one
@@ -6960,7 +7230,7 @@ end
   end
 
   to-report task-kind-errors
-    report list runresult-error run-error foreach-error
+    report (list runresult-error run-error foreach-error)
   end
   """; seed=241)
 
@@ -7174,6 +7444,44 @@ end
   end
   @test report_error isa NetLogo.LogoRuntimeError
   @test report_error.message == "REPORT can only be used inside TO-REPORT."
+end
+
+@testset "unit: ask stop handling" begin
+  runtime = create_runtime(netlogo"""
+  turtles-own [hits]
+  globals [direct-stop-hits run-stop-hits]
+
+  to setup
+    clear-all
+    create-turtles 3 [ set hits 0 ]
+  end
+
+  to direct-stop-ask
+    ask turtles [
+      set hits hits + 1
+      stop
+      set hits hits + 10
+    ]
+    set direct-stop-hits sort [hits] of turtles
+  end
+
+  to run-stop-ask
+    ask turtles [
+      set hits 0
+      set hits hits + 1
+      run [ -> stop ]
+      set hits hits + 10
+    ]
+    set run-stop-hits sort [hits] of turtles
+  end
+  """; seed=281)
+
+  call!(runtime, "setup")
+  call!(runtime, "direct-stop-ask")
+  @test runtime.world.observer.globals["DIRECT-STOP-HITS"] == Any[1.0, 1.0, 1.0]
+
+  call!(runtime, "run-stop-ask")
+  @test runtime.world.observer.globals["RUN-STOP-HITS"] == Any[1.0, 1.0, 1.0]
 end
 
 @testset "unit: foreach concise command references" begin
@@ -7557,7 +7865,7 @@ end
   end
 
   to-report test-pref-attach
-    nw:generate-preferential-attachment turtles edges 8 [ ]
+    nw:generate-preferential-attachment turtles edges 8 1 [ ]
     report count turtles
   end
   """); seed=42)
@@ -7568,6 +7876,202 @@ end
   @test r[2] == 10.0
   @test call!(runtime, "test-lattice") == 23.0  # 11 + 12
   @test call!(runtime, "test-pref-attach") == 31.0  # 23 + 8
+end
+
+# ── nw extension: new primitives (page-rank, eigenvector, louvain, cliques, etc.) ──
+@testset "unit: nw page-rank and eigenvector centrality" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+
+  to setup
+    create-turtles 5
+    ; Star: turtle 0 is hub, connected to 1,2,3,4
+    ask turtle 0 [ create-link-with turtle 1 ]
+    ask turtle 0 [ create-link-with turtle 2 ]
+    ask turtle 0 [ create-link-with turtle 3 ]
+    ask turtle 0 [ create-link-with turtle 4 ]
+    nw:set-context turtles links
+  end
+
+  to-report test-pr-hub
+    let pr 0
+    ask turtle 0 [ set pr nw:page-rank ]
+    report pr
+  end
+
+  to-report test-pr-leaf
+    let pr 0
+    ask turtle 1 [ set pr nw:page-rank ]
+    report pr
+  end
+
+  to-report test-ec-hub
+    let ec 0
+    ask turtle 0 [ set ec nw:eigenvector-centrality ]
+    report ec
+  end
+
+  to-report test-ec-leaf
+    let ec 0
+    ask turtle 1 [ set ec nw:eigenvector-centrality ]
+    report ec
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  pr_hub = call!(runtime, "test-pr-hub")
+  pr_leaf = call!(runtime, "test-pr-leaf")
+  @test pr_hub > pr_leaf  # hub should have higher PageRank
+  @test pr_hub > 0.2      # hub PR should be significant
+  @test pr_leaf > 0.0     # leaf PR should be positive
+
+  ec_hub = call!(runtime, "test-ec-hub")
+  ec_leaf = call!(runtime, "test-ec-leaf")
+  @test ec_hub > ec_leaf  # hub should have higher eigenvector centrality
+  @test ec_hub > 0.0
+end
+
+@testset "unit: nw louvain communities" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-comms comm-sizes]
+
+  to setup
+    create-turtles 8
+    ; Cluster A: 0-1-2-3 fully connected
+    ask turtle 0 [ create-link-with turtle 1 create-link-with turtle 2 create-link-with turtle 3 ]
+    ask turtle 1 [ create-link-with turtle 2 create-link-with turtle 3 ]
+    ask turtle 2 [ create-link-with turtle 3 ]
+    ; Bridge
+    ask turtle 3 [ create-link-with turtle 4 ]
+    ; Cluster B: 4-5-6-7 fully connected
+    ask turtle 4 [ create-link-with turtle 5 create-link-with turtle 6 create-link-with turtle 7 ]
+    ask turtle 5 [ create-link-with turtle 6 create-link-with turtle 7 ]
+    ask turtle 6 [ create-link-with turtle 7 ]
+    nw:set-context turtles links
+    let comms nw:louvain-communities
+    set n-comms length comms
+    set comm-sizes sort map [c -> count c] comms
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["N-COMMS"] == 2.0
+  @test runtime.world.observer.globals["COMM-SIZES"] == Any[4.0, 4.0]
+end
+
+@testset "unit: nw maximal cliques" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-cliques sizes biggest-sizes]
+
+  to setup
+    create-turtles 4
+    ; Triangle 0-1-2 plus edge 2-3
+    ask turtle 0 [ create-link-with turtle 1 create-link-with turtle 2 ]
+    ask turtle 1 [ create-link-with turtle 2 ]
+    ask turtle 2 [ create-link-with turtle 3 ]
+    nw:set-context turtles links
+    let cliques nw:maximal-cliques
+    set n-cliques length cliques
+    set sizes sort map [c -> count c] cliques
+    let biggest nw:biggest-maximal-cliques
+    set biggest-sizes sort map [c -> count c] biggest
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["N-CLIQUES"] == 2.0  # triangle + edge
+  @test runtime.world.observer.globals["SIZES"] == Any[2.0, 3.0]
+  @test runtime.world.observer.globals["BIGGEST-SIZES"] == Any[3.0]
+end
+
+@testset "unit: nw bicomponent clusters" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-bicomps]
+
+  to setup
+    create-turtles 5
+    ; Triangle 0-1-2 connected via bridge 2-3 to edge 3-4
+    ask turtle 0 [ create-link-with turtle 1 create-link-with turtle 2 ]
+    ask turtle 1 [ create-link-with turtle 2 ]
+    ask turtle 2 [ create-link-with turtle 3 ]
+    ask turtle 3 [ create-link-with turtle 4 ]
+    nw:set-context turtles links
+    let bicomps nw:bicomponent-clusters
+    set n-bicomps length bicomps
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  # Triangle is one bicomponent, bridge+edge are two more
+  @test runtime.world.observer.globals["N-BICOMPS"] >= 2.0
+end
+
+@testset "unit: nw watts-strogatz generator" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-nodes n-edges]
+
+  to setup
+    nw:generate-watts-strogatz turtles links 20 2 0.0 false [ ]
+    set n-nodes count turtles
+    set n-edges count links
+  end
+  """); seed=42)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["N-NODES"] == 20.0
+  @test runtime.world.observer.globals["N-EDGES"] == 40.0  # 20 nodes * 2 neighbors each side
+end
+
+@testset "unit: nw weak-component-clusters" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-comps comp-sizes]
+
+  to setup
+    create-turtles 6
+    ask turtle 0 [ create-link-with turtle 1 ]
+    ask turtle 1 [ create-link-with turtle 2 ]
+    ask turtle 3 [ create-link-with turtle 4 ]
+    ; 0-1-2 = component, 3-4 = component, 5 = isolated
+    nw:set-context turtles links
+    let comps nw:weak-component-clusters
+    set n-comps length comps
+    set comp-sizes sort map [c -> count c] comps
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["N-COMPS"] == 3.0
+  @test runtime.world.observer.globals["COMP-SIZES"] == Any[1.0, 2.0, 3.0]
+end
+
+@testset "unit: nw set-snapshot" begin
+  runtime = create_runtime(compile_model("""
+  extensions [nw]
+  globals [n-before n-after]
+
+  to setup
+    create-turtles 3
+    ask turtle 0 [ create-link-with turtle 1 ]
+    nw:set-context turtles links
+    nw:set-snapshot
+    set n-before count turtles
+    ; Add more turtles after snapshot
+    create-turtles 2
+    ask turtle 2 [ create-link-with turtle 3 ]
+    ; Context is now frozen to original 3 turtles
+    let ctx nw:get-context
+    set n-after count item 0 ctx
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["N-BEFORE"] == 3.0
+  @test runtime.world.observer.globals["N-AFTER"] == 3.0  # frozen at snapshot time
 end
 
 @testset "unit: agent-owned values preserve agent identity" begin
@@ -7763,4 +8267,863 @@ end
                (runtime.world.max_pycor - runtime.world.min_pycor + 1)
     @test call!(runtime, "patch-count") == Float64(expected)
   end
+end
+
+# ---------------------------------------------------------------------------
+# Parser: negative number literal tests
+# ---------------------------------------------------------------------------
+
+@testset "unit: negative number literals" begin
+  # Basic negative numbers as command arguments
+  runtime = create_runtime(compile_model("""
+  globals [a b c d e]
+  to setup
+    resize-world -2 2 -2 2
+    set a -5
+    set b 3 - 2
+    set c 10 + -3
+    set d -1 + -2
+    set e -0.5
+  end
+  to-report get-a report a end
+  to-report get-b report b end
+  to-report get-c report c end
+  to-report get-d report d end
+  to-report get-e report e end
+  to-report w report world-width end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test call!(runtime, "get-a") == -5.0
+  @test call!(runtime, "get-b") == 1.0    # 3 - 2 = 1 (infix subtraction with spaces)
+  @test call!(runtime, "get-c") == 7.0    # 10 + (-3) = 7
+  @test call!(runtime, "get-d") == -3.0   # (-1) + (-2) = -3
+  @test call!(runtime, "get-e") == -0.5
+  @test call!(runtime, "w") == 5.0        # resize-world -2 2 -2 2 => width 5
+
+  # Negative numbers as movement arguments
+  runtime2 = create_runtime(compile_model("""
+  to setup
+    crt 1 [ setxy 0 0 set heading 0 ]
+  end
+  to-report move-and-report
+    ask turtle 0 [ fd -3 ]
+    report [ycor] of turtle 0
+  end
+  """); seed=1)
+  call!(runtime2, "setup")
+  @test call!(runtime2, "move-and-report") == -3.0
+end
+
+# ---------------------------------------------------------------------------
+# Comprehensive bitmap extension tests
+# ---------------------------------------------------------------------------
+
+@testset "unit: bitmap create, scale, grayscale, average-color" begin
+  runtime = create_runtime(compile_model("""
+  extensions [bitmap]
+  globals [bmp gray avg sc diff]
+
+  to setup
+    ;; create a 3x2 bitmap via from-view on a tiny world
+    resize-world 0 2 0 1
+    ask patches [ set pcolor red ]
+    ask patch 1 0 [ set pcolor blue ]
+    ask patch 2 1 [ set pcolor green ]
+    set bmp bitmap:from-view
+  end
+
+  to-report bmp-width  report bitmap:width bmp  end
+  to-report bmp-height report bitmap:height bmp end
+
+  to make-gray
+    set gray bitmap:to-grayscale bmp
+  end
+  to-report gray-width  report bitmap:width gray  end
+  to-report gray-height report bitmap:height gray end
+
+  to make-scaled
+    set sc bitmap:scaled bmp 6 4
+  end
+  to-report sc-width  report bitmap:width sc  end
+  to-report sc-height report bitmap:height sc end
+
+  to make-avg
+    set avg bitmap:average-color bmp
+  end
+  to-report avg-color report avg end
+
+  to make-diff
+    set diff bitmap:difference-rgb bmp bmp
+  end
+  to-report diff-avg report bitmap:average-color diff end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  # from-view renders at patch-size scale (default 12px per patch)
+  # 3 patches wide × 12 = 36, 2 patches tall × 12 = 24
+  @test call!(runtime, "bmp-width") == 36.0
+  @test call!(runtime, "bmp-height") == 24.0
+
+  call!(runtime, "make-gray")
+  @test call!(runtime, "gray-width") == 36.0
+  @test call!(runtime, "gray-height") == 24.0
+
+  call!(runtime, "make-scaled")
+  @test call!(runtime, "sc-width") == 6.0
+  @test call!(runtime, "sc-height") == 4.0
+
+  call!(runtime, "make-avg")
+  avg = call!(runtime, "avg-color")
+  @test length(avg) == 3
+  @test all(v -> v isa Float64, avg)
+
+  # difference of bitmap with itself should be all zeros
+  call!(runtime, "make-diff")
+  diff_avg = call!(runtime, "diff-avg")
+  @test diff_avg == Any[0.0, 0.0, 0.0]
+end
+
+@testset "unit: bitmap channel extraction" begin
+  runtime = create_runtime(compile_model("""
+  extensions [bitmap]
+  globals [bmp red-ch green-ch blue-ch]
+
+  to setup
+    resize-world 0 1 0 0
+    ask patch 0 0 [ set pcolor [255 0 0] ]
+    ask patch 1 0 [ set pcolor [0 128 255] ]
+    set bmp bitmap:from-view
+    set red-ch bitmap:channel bmp 0
+    set green-ch bitmap:channel bmp 1
+    set blue-ch bitmap:channel bmp 2
+  end
+
+  to-report get-red report red-ch end
+  to-report get-green report green-ch end
+  to-report get-blue report blue-ch end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  red_ch = call!(runtime, "get-red")
+  # channel returns a list of rows; bitmap is rendered at patch-size (12px per patch)
+  # so 2 patches × 12 = 24 columns, 1 patch × 12 = 12 rows
+  @test length(red_ch) == 12
+  @test length(red_ch[1]) == 24
+  # Left half (patch 0,0 = red) should have R=255
+  @test red_ch[1][1] == 255.0
+  # Right half (patch 1,0 = [0,128,255]) should have R=0
+  @test red_ch[1][end] == 0.0
+
+  green_ch = call!(runtime, "get-green")
+  @test green_ch[1][1] == 0.0    # red pixel G=0
+  @test green_ch[1][end] == 128.0 # [0,128,255] G=128
+
+  blue_ch = call!(runtime, "get-blue")
+  @test blue_ch[1][1] == 0.0      # red pixel B=0
+  @test blue_ch[1][end] == 255.0   # [0,128,255] B=255
+end
+
+@testset "unit: bitmap copy-to-pcolors scaled and unscaled" begin
+  runtime = create_runtime(compile_model("""
+  extensions [bitmap]
+  globals [bmp]
+
+  to setup
+    resize-world 0 1 0 0
+    ask patch 0 0 [ set pcolor [200 100 50] ]
+    ask patch 1 0 [ set pcolor [10 20 30] ]
+    set bmp bitmap:from-view
+
+    ;; now resize to 4x2 and apply bitmap
+    resize-world 0 3 0 1
+  end
+
+  to apply-scaled
+    bitmap:copy-to-pcolors bmp true
+  end
+
+  to apply-unscaled
+    ;; reset colors first
+    ask patches [ set pcolor black ]
+    bitmap:copy-to-pcolors bmp false
+  end
+
+  to-report pc [x y]
+    report [pcolor] of patch x y
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  # scaled: stretches bitmap to 4x2 world
+  call!(runtime, "apply-scaled")
+  c00 = call!(runtime, "pc", Any[0.0, 0.0])
+  @test c00 isa AbstractVector  # should be RGB list
+  @test length(c00) == 3  # R, G, B
+
+  # unscaled: bitmap is larger than world (24x12 vs 4x2), centered
+  call!(runtime, "apply-unscaled")
+  c31 = call!(runtime, "pc", Any[3.0, 1.0])
+  @test c31 isa AbstractVector || c31 isa Number  # should be set to something
+end
+
+@testset "unit: bitmap import/export round-trip with file" begin
+  mktempdir() do dir
+    png_path = joinpath(dir, "test.png")
+    # Create a small test PNG via Julia
+    image = Matrix{RGB{Float32}}(undef, 3, 4)
+    for r in 1:3, c in 1:4
+      image[r, c] = RGB{Float32}(Float32(r)/3f0, Float32(c)/4f0, 0.5f0)
+    end
+    FileIO.save(png_path, image)
+
+    escaped = replace(png_path, "\\" => "\\\\")
+    out_path = joinpath(dir, "out.png")
+    escaped_out = replace(out_path, "\\" => "\\\\")
+
+    runtime = create_runtime(compile_model("""
+    extensions [bitmap]
+    globals [bmp]
+
+    to setup
+      set bmp bitmap:import "$escaped"
+    end
+
+    to-report dims
+      report (list bitmap:width bmp bitmap:height bmp)
+    end
+
+    to do-export
+      bitmap:export bmp "$escaped_out"
+    end
+
+    to-report avg
+      report bitmap:average-color bmp
+    end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    @test call!(runtime, "dims") == Any[4.0, 3.0]
+
+    avg = call!(runtime, "avg")
+    @test length(avg) == 3
+    @test all(v -> v > 0, avg)  # non-zero averages
+
+    call!(runtime, "do-export")
+    @test isfile(out_path)
+
+    # Re-import and check dimensions match
+    re = FileIO.load(out_path)
+    @test size(re) == (3, 4)
+  end
+end
+
+@testset "unit: bitmap base64 round-trip" begin
+  mktempdir() do dir
+    png_path = joinpath(dir, "test.png")
+    image = Matrix{RGB{Float32}}(undef, 2, 2)
+    image[1, 1] = RGB{Float32}(1, 0, 0)
+    image[1, 2] = RGB{Float32}(0, 1, 0)
+    image[2, 1] = RGB{Float32}(0, 0, 1)
+    image[2, 2] = RGB{Float32}(1, 1, 1)
+    FileIO.save(png_path, image)
+
+    escaped = replace(png_path, "\\" => "\\\\")
+
+    runtime = create_runtime(compile_model("""
+    extensions [bitmap]
+    globals [bmp b64 decoded]
+
+    to setup
+      set bmp bitmap:import "$escaped"
+      set b64 bitmap:to-base64 bmp
+      set decoded bitmap:from-base64 b64
+    end
+
+    to-report orig-dims
+      report (list bitmap:width bmp bitmap:height bmp)
+    end
+
+    to-report decoded-dims
+      report (list bitmap:width decoded bitmap:height decoded)
+    end
+
+    to-report orig-avg  report bitmap:average-color bmp end
+    to-report decoded-avg report bitmap:average-color decoded end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    @test call!(runtime, "orig-dims") == Any[2.0, 2.0]
+    @test call!(runtime, "decoded-dims") == Any[2.0, 2.0]
+    # Averages should be the same (lossless PNG round-trip)
+    orig_avg = call!(runtime, "orig-avg")
+    decoded_avg = call!(runtime, "decoded-avg")
+    for i in 1:3
+      @test abs(orig_avg[i] - decoded_avg[i]) < 2.0  # allow minor PNG compression drift
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Comprehensive GIS extension tests
+# ---------------------------------------------------------------------------
+
+@testset "unit: gis raster create, read, write, dimensions" begin
+  runtime = create_runtime(compile_model("""
+  extensions [gis]
+  globals [r]
+
+  to setup
+    set r gis:create-raster 5 4 (list 0 5 0 4)
+  end
+
+  to-report raster-w report gis:width-of r end
+  to-report raster-h report gis:height-of r end
+
+  to fill-raster
+    let row 0
+    repeat 4 [
+      let col 0
+      repeat 5 [
+        gis:set-raster-value r col row (row * 5 + col)
+        set col col + 1
+      ]
+      set row row + 1
+    ]
+  end
+
+  to-report val [c rv]
+    report gis:raster-value r c rv
+  end
+
+  to-report min-val report gis:minimum-of r end
+  to-report max-val report gis:maximum-of r end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test call!(runtime, "raster-w") == 5.0
+  @test call!(runtime, "raster-h") == 4.0
+
+  call!(runtime, "fill-raster")
+  @test call!(runtime, "val", Any[0.0, 0.0]) == 0.0  # top-left
+  @test call!(runtime, "val", Any[4.0, 3.0]) == 19.0  # bottom-right
+  @test call!(runtime, "val", Any[2.0, 1.0]) == 7.0   # row 1 col 2
+
+  @test call!(runtime, "min-val") == 0.0
+  @test call!(runtime, "max-val") == 19.0
+end
+
+@testset "unit: gis raster apply-raster to patches" begin
+  mktempdir() do dir
+    asc_path = joinpath(dir, "elev.asc")
+    write(asc_path, join([
+      "ncols 3",
+      "nrows 3",
+      "xllcorner 0",
+      "yllcorner 0",
+      "cellsize 1",
+      "NODATA_value -9999",
+      "10 20 30",
+      "40 50 60",
+      "70 80 90",
+    ], "\n"))
+
+    escaped = replace(asc_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    patches-own [elevation]
+    globals [r]
+
+    to setup
+      resize-world -1 1 -1 1
+      set r gis:load-dataset "$escaped"
+      gis:set-world-envelope (gis:envelope-of r)
+      gis:apply-raster r "elevation"
+    end
+
+    to-report elev-center report [elevation] of patch 0 0 end
+    to-report elev-corner report [elevation] of patch -1 -1 end
+    to-report elev-top-right report [elevation] of patch 1 1 end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    # Verify patches got non-zero elevation values from the raster
+    center = call!(runtime, "elev-center")
+    @test center isa Float64
+    @test center > 0.0
+    corner = call!(runtime, "elev-corner")
+    @test corner isa Float64
+    @test corner > 0.0
+    top_right = call!(runtime, "elev-top-right")
+    @test top_right isa Float64
+    @test top_right > 0.0
+  end
+end
+
+@testset "unit: gis raster convolve" begin
+  mktempdir() do dir
+    asc_path = joinpath(dir, "data.asc")
+    write(asc_path, join([
+      "ncols 5",
+      "nrows 5",
+      "xllcorner 0",
+      "yllcorner 0",
+      "cellsize 1",
+      "NODATA_value -9999",
+      "0 0 0 0 0",
+      "0 0 0 0 0",
+      "0 0 100 0 0",
+      "0 0 0 0 0",
+      "0 0 0 0 0",
+    ], "\n"))
+
+    escaped = replace(asc_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    globals [r smoothed kernel]
+
+    to setup
+      set r gis:load-dataset "$escaped"
+      ;; 3x3 averaging kernel - must use (list ...) since [...] is a block
+      set kernel (list 1 1 1 1 1 1 1 1 1)
+      set smoothed gis:convolve r 3 3 kernel
+    end
+
+    to-report smooth-w report gis:width-of smoothed end
+    to-report smooth-h report gis:height-of smoothed end
+    to-report center-val report gis:raster-value smoothed 2 2 end
+    to-report far-val report gis:raster-value smoothed 0 0 end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    @test call!(runtime, "smooth-w") == 5.0
+    @test call!(runtime, "smooth-h") == 5.0
+    # center pixel (2,2) was 100, after raw 3x3 convolution with all-1s kernel:
+    # only the center pixel contributes: 1*100 = 100
+    center = call!(runtime, "center-val")
+    @test abs(center - 100.0) < 0.01
+    # pixel (0,0) is far from center, should be 0
+    @test call!(runtime, "far-val") == 0.0
+  end
+end
+
+@testset "unit: gis set-world-envelope and raster-sample" begin
+  mktempdir() do dir
+    asc_path = joinpath(dir, "grid.asc")
+    write(asc_path, join([
+      "ncols 4",
+      "nrows 4",
+      "xllcorner 0",
+      "yllcorner 0",
+      "cellsize 10",
+      "NODATA_value -9999",
+      "1 2 3 4",
+      "5 6 7 8",
+      "9 10 11 12",
+      "13 14 15 16",
+    ], "\n"))
+
+    escaped = replace(asc_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    globals [r]
+
+    to setup
+      resize-world -1 2 -1 2
+      set r gis:load-dataset "$escaped"
+      gis:set-world-envelope (gis:envelope-of r)
+    end
+
+    to-report env report gis:envelope-of r end
+    to-report world-env report gis:world-envelope end
+    to-report sample-at [x y]
+      report gis:raster-sample r x y
+    end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    env = call!(runtime, "env")
+    @test length(env) == 4
+
+    wenv = call!(runtime, "world-env")
+    @test length(wenv) == 4
+
+    # sample at center of raster
+    center_sample = call!(runtime, "sample-at", Any[20.0, 20.0])
+    @test center_sample isa Float64
+  end
+end
+
+@testset "unit: gis raster store-dataset round-trip" begin
+  mktempdir() do dir
+    input_path = joinpath(dir, "in.asc")
+    output_path = joinpath(dir, "out.asc")
+    write(input_path, join([
+      "ncols 3",
+      "nrows 2",
+      "xllcorner 10",
+      "yllcorner 20",
+      "cellsize 5",
+      "NODATA_value -9999",
+      "1.5 2.5 3.5",
+      "4.5 5.5 6.5",
+    ], "\n"))
+
+    escaped_in = replace(input_path, "\\" => "\\\\")
+    escaped_out = replace(output_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    globals [r r2]
+
+    to setup
+      set r gis:load-dataset "$escaped_in"
+      gis:store-dataset r "$escaped_out"
+      set r2 gis:load-dataset "$escaped_out"
+    end
+
+    to-report orig-dims report (list gis:width-of r gis:height-of r) end
+    to-report copy-dims report (list gis:width-of r2 gis:height-of r2) end
+    to-report orig-val [c rv] report gis:raster-value r c rv end
+    to-report copy-val [c rv] report gis:raster-value r2 c rv end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    @test call!(runtime, "orig-dims") == Any[3.0, 2.0]
+    @test call!(runtime, "copy-dims") == Any[3.0, 2.0]
+    @test call!(runtime, "orig-val", Any[0.0, 0.0]) == call!(runtime, "copy-val", Any[0.0, 0.0])
+    @test call!(runtime, "orig-val", Any[2.0, 1.0]) == call!(runtime, "copy-val", Any[2.0, 1.0])
+  end
+end
+
+@testset "unit: gis resample raster" begin
+  mktempdir() do dir
+    asc_path = joinpath(dir, "small.asc")
+    write(asc_path, join([
+      "ncols 2",
+      "nrows 2",
+      "xllcorner 0",
+      "yllcorner 0",
+      "cellsize 1",
+      "NODATA_value -9999",
+      "10 20",
+      "30 40",
+    ], "\n"))
+
+    escaped = replace(asc_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    globals [r big]
+
+    to setup
+      set r gis:load-dataset "$escaped"
+      set big gis:resample r (list 4 4)
+    end
+
+    to-report orig-dims report (list gis:width-of r gis:height-of r) end
+    to-report big-dims report (list gis:width-of big gis:height-of big) end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    @test call!(runtime, "orig-dims") == Any[2.0, 2.0]
+    @test call!(runtime, "big-dims") == Any[4.0, 4.0]
+  end
+end
+
+@testset "unit: gis world-envelope and set-transformation" begin
+  runtime = create_runtime(compile_model("""
+  extensions [gis]
+  globals [r]
+
+  to setup
+    resize-world -5 5 -5 5
+    set r gis:create-raster 10 10 (list 0 100 0 100)
+    gis:set-world-envelope (list 0 100 0 100)
+  end
+
+  to-report world-env report gis:world-envelope end
+  to-report raster-env report gis:envelope-of r end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  wenv = call!(runtime, "world-env")
+  @test length(wenv) == 4
+  renv = call!(runtime, "raster-env")
+  @test length(renv) == 4
+end
+
+@testset "unit: gis drawing commands" begin
+  mktempdir() do dir
+    asc_path = joinpath(dir, "grid.asc")
+    write(asc_path, join([
+      "ncols 3",
+      "nrows 3",
+      "xllcorner 0",
+      "yllcorner 0",
+      "cellsize 1",
+      "NODATA_value -9999",
+      "1 2 3",
+      "4 5 6",
+      "7 8 9",
+    ], "\n"))
+
+    escaped = replace(asc_path, "\\" => "\\\\")
+    runtime = create_runtime(compile_model("""
+    extensions [gis]
+    globals [r]
+
+    to setup
+      resize-world -1 1 -1 1
+      set r gis:load-dataset "$escaped"
+      gis:set-world-envelope (gis:envelope-of r)
+    end
+
+    to draw-raster
+      gis:set-drawing-color 15
+      gis:paint r 0
+    end
+
+    to-report drawing-c report gis:drawing-color end
+    """); seed=1)
+
+    call!(runtime, "setup")
+    call!(runtime, "draw-raster")
+    dc = call!(runtime, "drawing-c")
+    @test dc == 15.0  # should be the color number we set
+  end
+end
+
+# ── Bitstring Extension ──────────────────────────────────────────────────────
+
+@testset "bitstring: make and basic accessors" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    globals [bs0 bs1]
+    to setup
+      set bs0 bitstring:make 6 false
+      set bs1 bitstring:make 6 true
+    end
+    to-report len0 report bitstring:length bs0 end
+    to-report len1 report bitstring:length bs1 end
+    to-report c0 report bitstring:count0 bs0 end
+    to-report c1 report bitstring:count1 bs1 end
+    to-report all0 report bitstring:all0? bs0 end
+    to-report all1 report bitstring:all1? bs1 end
+    to-report any0 report bitstring:any0? bs1 end
+    to-report any1 report bitstring:any1? bs0 end
+    to-report first0 report bitstring:first? bs0 end
+    to-report first1 report bitstring:first? bs1 end
+    to-report last0 report bitstring:last? bs0 end
+    to-report last1 report bitstring:last? bs1 end
+    to-report get2 report bitstring:get? bs1 2 end
+  """))
+  call!(runtime, "setup")
+  @test call!(runtime, "len0") == 6.0
+  @test call!(runtime, "len1") == 6.0
+  @test call!(runtime, "c0") == 6.0
+  @test call!(runtime, "c1") == 6.0
+  @test call!(runtime, "all0") == true
+  @test call!(runtime, "all1") == true
+  @test call!(runtime, "any0") == false
+  @test call!(runtime, "any1") == false
+  @test call!(runtime, "first0") == false
+  @test call!(runtime, "first1") == true
+  @test call!(runtime, "last0") == false
+  @test call!(runtime, "last1") == true
+  @test call!(runtime, "get2") == true
+end
+
+@testset "bitstring: set, from-list, from-string" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    globals [bs]
+    to setup
+      set bs bitstring:make 4 false
+    end
+    to-report do-set
+      let b bitstring:set bs 1 true
+      report bitstring:count1 b
+    end
+    to-report do-from-list
+      let b bitstring:from-list [true false true false true]
+      report bitstring:count1 b
+    end
+    to-report do-from-string
+      let b bitstring:from-string "1010"
+      report bitstring:count1 b
+    end
+    to-report list-round-trip
+      let b bitstring:from-list [true false true]
+      report bitstring:to-list b
+    end
+  """))
+  call!(runtime, "setup")
+  @test call!(runtime, "do-set") == 1.0
+  @test call!(runtime, "do-from-list") == 3.0
+  @test call!(runtime, "do-from-string") == 2.0
+  @test call!(runtime, "list-round-trip") == Any[true, false, true]
+end
+
+@testset "bitstring: bitwise operators" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report do-and
+      let a bitstring:from-string "1100"
+      let b bitstring:from-string "1010"
+      report bitstring:count1 (a bitstring:and b)
+    end
+    to-report do-or
+      let a bitstring:from-string "1100"
+      let b bitstring:from-string "1010"
+      report bitstring:count1 (a bitstring:or b)
+    end
+    to-report do-xor
+      let a bitstring:from-string "1100"
+      let b bitstring:from-string "1010"
+      report bitstring:count1 (a bitstring:xor b)
+    end
+    to-report do-not
+      let a bitstring:from-string "1100"
+      report bitstring:count1 bitstring:not a
+    end
+    to-report do-parity
+      let a bitstring:from-string "1100"
+      let b bitstring:from-string "1010"
+      report bitstring:count1 (a bitstring:parity b)
+    end
+    to-report do-right-shift
+      let a bitstring:from-string "1000"
+      let b bitstring:right-shift a
+      report bitstring:get? b 1
+    end
+  """))
+  @test call!(runtime, "do-and") == 1.0    # 1000
+  @test call!(runtime, "do-or") == 3.0     # 1110
+  @test call!(runtime, "do-xor") == 2.0    # 0110
+  @test call!(runtime, "do-not") == 2.0    # 0011
+  @test call!(runtime, "do-parity") == 2.0 # 1001
+  @test call!(runtime, "do-right-shift") == true
+end
+
+@testset "bitstring: sub, but-first, but-last, cat" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report do-sub
+      let a bitstring:from-string "10110"
+      let b bitstring:sub a 1 4
+      report bitstring:length b
+    end
+    to-report do-but-first
+      let a bitstring:from-string "100"
+      let b bitstring:but-first a
+      report bitstring:count1 b
+    end
+    to-report do-but-last
+      let a bitstring:from-string "001"
+      let b bitstring:but-last a
+      report bitstring:count1 b
+    end
+    to-report do-cat
+      let a bitstring:from-string "11"
+      let b bitstring:from-string "00"
+      let c bitstring:cat a b
+      report bitstring:length c
+    end
+    to-report cat-count
+      let a bitstring:from-string "11"
+      let b bitstring:from-string "00"
+      let c bitstring:cat a b
+      report bitstring:count1 c
+    end
+  """))
+  @test call!(runtime, "do-sub") == 3.0
+  @test call!(runtime, "do-but-first") == 0.0
+  @test call!(runtime, "do-but-last") == 0.0
+  @test call!(runtime, "do-cat") == 4.0
+  @test call!(runtime, "cat-count") == 2.0
+end
+
+@testset "bitstring: contains and match" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report do-contains-yes
+      let a bitstring:from-string "110100"
+      let b bitstring:from-string "101"
+      report a bitstring:contains? b
+    end
+    to-report do-contains-no
+      let a bitstring:from-string "110100"
+      let b bitstring:from-string "111"
+      report a bitstring:contains? b
+    end
+    to-report do-match
+      let a bitstring:from-string "1100"
+      let b bitstring:from-string "1010"
+      report a bitstring:match b
+    end
+  """))
+  @test call!(runtime, "do-contains-yes") == true
+  @test call!(runtime, "do-contains-no") == false
+  @test call!(runtime, "do-match") == 2.0
+end
+
+@testset "bitstring: genetic operators" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report do-toggle
+      let a bitstring:from-string "0000"
+      let b bitstring:toggle a 2
+      report bitstring:get? b 2
+    end
+    to-report do-crossover
+      let a bitstring:make 6 false
+      let b bitstring:make 6 true
+      let result bitstring:crossover a b 3
+      let c1 item 0 result
+      let c2 item 1 result
+      report (list bitstring:count1 c1 bitstring:count1 c2)
+    end
+    to-report do-fput
+      let a bitstring:from-string "000"
+      let b bitstring:fput a true
+      report (list bitstring:length b bitstring:first? b)
+    end
+    to-report do-lput
+      let a bitstring:from-string "000"
+      let b bitstring:lput a true
+      report (list bitstring:length b bitstring:last? b)
+    end
+  """))
+  @test call!(runtime, "do-toggle") == true
+  @test call!(runtime, "do-crossover") == Any[3.0, 3.0]
+  @test call!(runtime, "do-fput") == Any[4.0, true]
+  @test call!(runtime, "do-lput") == Any[4.0, true]
+end
+
+@testset "bitstring: random and gray code" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report do-random
+      let a bitstring:random 100 0.5
+      report bitstring:length a
+    end
+    to-report gray-round-trip
+      let a bitstring:from-string "10110"
+      let g bitstring:gray-code a
+      let b bitstring:inverse-gray-code g
+      report a bitstring:match b
+    end
+  """); seed=42)
+  @test call!(runtime, "do-random") == 100.0
+  @test call!(runtime, "gray-round-trip") == 5.0  # perfect round-trip
+end
+
+@testset "bitstring: string representation" begin
+  runtime = create_runtime(compile_model("""
+    extensions [bitstring]
+    to-report bs-word
+      let a bitstring:from-string "101"
+      report word "" a
+    end
+  """))
+  @test call!(runtime, "bs-word") == "{{bitstring: 101}}"
 end

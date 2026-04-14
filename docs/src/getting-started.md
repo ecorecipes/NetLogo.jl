@@ -55,6 +55,30 @@ call!(runtime, "setup")
 
 `load_model` sets the source path used for relative `__includes` resolution, so included `.nls` files are handled the same way as embedded model code.
 
+## Optional browser and notebook GUI
+
+If a model has interface widgets, you can expose them through a local browser UI:
+
+```julia
+using NetLogo
+
+model = load_model("path/to/model.nlogo")
+backend = start_web_gui(model; seed=1, port=8081)
+
+web_gui_url(backend)
+```
+
+For Pluto or other notebook frontends, wrap the same session as an embeddable iframe:
+
+```julia
+using NetLogo
+
+model = load_model("path/to/model.nlogo")
+gui = pluto_gui(model; seed=1, port=8081, width=1000, height=800)
+
+gui
+```
+
 ## Inspecting runtime state
 
 The runtime exposes the compiled model, the live world state, output buffers, and plotting state:
