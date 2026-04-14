@@ -9,8 +9,8 @@ const BUILTIN_LINK_VARS = Set([
 ])
 const BUILTIN_VARIABLE_NAMES = union(BUILTIN_TURTLE_VARS, BUILTIN_PATCH_VARS, BUILTIN_LINK_VARS)
 
-is_identifier_start(c::Char) = isletter(c) || c == '_'
-is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'', '%')
+is_identifier_start(c::Char) = isletter(c) || c == '_' || c == '#' || c == '%'
+is_identifier_part(c::Char) = isletter(c) || isnumeric(c) || c in ('_', '-', '?', '!', ':', '\'', '%', '#')
 
 decode_logo_string_escape(c::Char) =
   c == '"' ? '"' :
@@ -189,6 +189,7 @@ struct RawProcedure
 end
 
 function parse_identifier_list(stream::TokenStream; allow_strings::Bool=false)
+  skip_newlines!(stream)
   expect!(stream, LBracketToken, "expected '['")
   names = String[]
   skip_newlines!(stream)
@@ -209,6 +210,7 @@ function parse_identifier_list(stream::TokenStream; allow_strings::Bool=false)
 end
 
 function parse_extension_name_list(stream::TokenStream)
+  skip_newlines!(stream)
   expect!(stream, LBracketToken, "expected '['")
   extensions = Pair{String, SourceSpan}[]
   skip_newlines!(stream)
@@ -229,6 +231,7 @@ end
 is_include_declaration(name::String) = name in INCLUDE_DECLARATION_NAMES
 
 function parse_include_path_list(stream::TokenStream)
+  skip_newlines!(stream)
   expect!(stream, LBracketToken, "expected '['")
   includes = Pair{String, SourceSpan}[]
   skip_newlines!(stream)
@@ -1211,9 +1214,99 @@ function parse_block(stream::TokenStream, model::ModelSpec, registry::PrimitiveR
   BlockNode(statements, span_union(start_span, end_span))
 end
 
+function parse_parenthesized_command(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
+  lparen = peek(stream)
+  advance!(stream)  # skip (
+  skip_newlines!(stream)
+
+  # Parse the inner statement (command + its normal arguments)
+  inner_token = peek(stream)
+  inner_token.kind == IdentifierToken || throw(Diagnostic("expected command", inner_token.span))
+  name = canonical_name(inner_token.lexeme)
+  advance!(stream)
+
+  # Parse the command's normal arguments
+  local args::Vector{Any}
+  local bindings::Vector{String}
+
+  if name == "FOREACH"
+    stmt, bindings = parse_foreach_statement(stream, inner_token, model, registry, scope)
+    # Collect extra variadic args
+    skip_newlines!(stream)
+    while !check(stream, RParenToken) && !check(stream, EofToken)
+      skip_newlines!(stream)
+      check(stream, RParenToken) && break
+      push!(stmt.args, parse_expression(stream, model, registry, scope, 0))
+      skip_newlines!(stream)
+    end
+    expect!(stream, RParenToken, "expected ')'")
+    return stmt, bindings
+  end
+
+  if name == "IFELSE"
+    # Variadic ifelse: (ifelse cond1 [block1] cond2 [block2] ... [else-block])
+    args = Any[]
+    bindings = String[]
+    skip_newlines!(stream)
+    while !check(stream, RParenToken) && !check(stream, EofToken)
+      skip_newlines!(stream)
+      check(stream, RParenToken) && break
+      if check(stream, LBracketToken)
+        # This is the else block (a command block not preceded by a condition)
+        push!(args, parse_command_block(stream, model, registry, scope))
+        skip_newlines!(stream)
+        break
+      end
+      # Parse condition expression
+      push!(args, parse_expression(stream, model, registry, scope, 0))
+      skip_newlines!(stream)
+      # Parse the corresponding command block
+      push!(args, parse_command_block(stream, model, registry, scope))
+      skip_newlines!(stream)
+    end
+    expect!(stream, RParenToken, "expected ')'")
+    return CommandCall(name, args, span_union(lparen.span, previous(stream).span)), bindings
+  end
+
+  spec = get_command(registry, name)
+  if spec !== nothing
+    args = parse_call_arguments(
+      stream, spec.syntax, model, registry, scope;
+      expression_min_precedence=0,
+      repeatable_across_newlines=name != "RUN")
+    bindings = name == "LET" && !isempty(args) && args[1] isa SymbolArg ? [args[1].name] : String[]
+  else
+    procedure = get(model.procedures, name, nothing)
+    if procedure !== nothing && !procedure.is_reporter
+      args = Any[parse_expression(stream, model, registry, scope, 0) for _ in procedure.inputs]
+      bindings = String[]
+    else
+      throw(Diagnostic("unknown command $(inner_token.lexeme)", inner_token.span))
+    end
+  end
+
+  # Collect extra variadic arguments until )
+  skip_newlines!(stream)
+  while !check(stream, RParenToken) && !check(stream, EofToken)
+    skip_newlines!(stream)
+    check(stream, RParenToken) && break
+    push!(args, parse_expression(stream, model, registry, scope, 0))
+    skip_newlines!(stream)
+  end
+
+  expect!(stream, RParenToken, "expected ')'")
+  return CommandCall(name, args, span_union(lparen.span, previous(stream).span)), bindings
+end
+
 function parse_statement(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
   skip_newlines!(stream)
   token = peek(stream)
+
+  # Handle parenthesized command calls: (command arg1 arg2 ...)
+  if token.kind == LParenToken
+    return parse_parenthesized_command(stream, model, registry, scope)
+  end
+
   token.kind == IdentifierToken || throw(Diagnostic("expected command", token.span))
   name = canonical_name(token.lexeme)
   advance!(stream)
@@ -1813,7 +1906,21 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
     return StringLiteral(String(token.value), token.span)
   elseif token.kind == LParenToken
     advance!(stream)
+    skip_newlines!(stream)
     expr = parse_expression(stream, model, registry, scope, 0)
+    skip_newlines!(stream)
+    # Check for variadic: if expr is a ReporterCall and there are more expressions before )
+    if expr isa ReporterCall && !check(stream, RParenToken)
+      extra_args = Any[]
+      while !check(stream, RParenToken) && !check(stream, EofToken)
+        skip_newlines!(stream)
+        check(stream, RParenToken) && break
+        push!(extra_args, parse_expression(stream, model, registry, scope, 0))
+        skip_newlines!(stream)
+      end
+      append!(expr.args, extra_args)
+      expr = ReporterCall(expr.name, expr.args, span_union(token.span, peek(stream).span))
+    end
     expect!(stream, RParenToken, "expected ')'")
     return expr
   elseif token.kind == LBracketToken
