@@ -9157,13 +9157,6 @@ function build_default_registry()
   register_primitive!(registry, "E", REPORTER, reporter_syntax(ret=NumberType),
     (ctx, args) -> MathConstants.e)
 
-  # System dynamics stubs
-  register_primitive!(registry, "SYSTEM-DYNAMICS-SETUP", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
-  register_primitive!(registry, "SYSTEM-DYNAMICS-GO", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
-  register_primitive!(registry, "SYSTEM-DYNAMICS-DO-PLOT", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
 
   # Legacy / internal commands
   register_primitive!(registry, "__SET-LINE-THICKNESS", COMMAND, command_syntax(right=[NumberType], agent_classes="-T--"),

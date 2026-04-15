@@ -1102,6 +1102,14 @@ function parse_model(
     return parse_nlogox_model(source, registry; source_path=source_path, extension_host=extension_host)
   end
   code_source, interface_source, has_interface_section = split_model_sections(source)
+
+  # Generate SD code from section 6 and prepend to code section
+  sd_section = extract_sd_section(source)
+  sd_code = parse_sd_section(sd_section)
+  if !isempty(sd_code)
+    code_source = sd_code * "\n" * code_source
+  end
+
   include_specs = collect_model_include_specs(code_source)
   if source_path === nothing
     isempty(include_specs) || throw(Diagnostic("Can't resolve __includes without a source path", last(first(include_specs))))
