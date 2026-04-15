@@ -1446,6 +1446,8 @@ end
 
 function clear_all_plots!(runtime::RuntimeState)
   foreach(clear_plot_state!, runtime.plot_manager.plots)
+  # After clearing, auto-select the first plot as current (matches Java NetLogo behavior)
+  runtime.plot_manager.current_plot = isempty(runtime.plot_manager.plots) ? nothing : runtime.plot_manager.plots[1]
   nothing
 end
 
@@ -2045,8 +2047,7 @@ function render_view_pixels(runtime::RuntimeState)
 
   render_patch_labels!(pixels, world; topology_wrap=true)
 
-  if world.drawing !== nothing
-    @assert size(world.drawing) == size(pixels)
+  if world.drawing !== nothing && size(world.drawing) == size(pixels)
     for index in eachindex(pixels, world.drawing)
       pixels[index] = composite_rgba_over(pixels[index], world.drawing[index])
     end
@@ -3547,8 +3548,10 @@ end
 
 function set_agent_variable!(world::World, agent::Link, name::String, value)
   ensure_live_agent(world, agent)
-  if name == "END1" || name == "END2" || name == "BREED"
+  if name == "END1" || name == "END2"
     throw(LogoRuntimeError("$name is read-only"))
+  elseif name == "BREED"
+    set_link_breed!(world, agent, link_breed_name(value))
   elseif name == "COLOR"
     agent.color = normalize_color_slot_value(value)
   elseif name == "LABEL"
@@ -3964,6 +3967,27 @@ function eval_reporter_block(
   caller::Union{Nothing, AbstractAgent}=context.agent,
   actuals::Vector{Any}=EMPTY_ACTUALS)
   eval_reporter_block(context, block, agent, caller, actuals)
+end
+
+# When a ReporterTaskValue is passed where a ReporterBlockNode is expected
+# (e.g., a variable holding a reporter task used with OF, WITH, etc.),
+# unwrap and invoke the task.
+function eval_reporter_block(
+  context::Context,
+  task::AbstractReporterTaskValue,
+  agent::AbstractAgent,
+  caller::Union{Nothing, AbstractAgent},
+  actuals::Vector{Any}=EMPTY_ACTUALS)
+  invoke_reporter_task(context, task, actuals; agent=agent, caller=caller)
+end
+
+function eval_reporter_block(
+  context::Context,
+  task::AbstractReporterTaskValue;
+  agent::AbstractAgent=context.agent,
+  caller::Union{Nothing, AbstractAgent}=context.agent,
+  actuals::Vector{Any}=EMPTY_ACTUALS)
+  invoke_reporter_task(context, task, actuals; agent=agent, caller=caller)
 end
 
 primitive_modes(spec::PrimitiveSpec) = spec.modes
@@ -5629,6 +5653,13 @@ function turtle_breed_name(value)
   value isa AgentSet && value.kind == TurtleKind ||
     throw(LogoRuntimeError("breed must be a turtle breed"))
   value.breed !== nothing || throw(LogoRuntimeError("breed must be a turtle breed"))
+  value.breed
+end
+
+function link_breed_name(value)
+  value isa AgentSet && value.kind == LinkKind ||
+    throw(LogoRuntimeError("breed must be a link breed"))
+  value.breed !== nothing || throw(LogoRuntimeError("breed must be a link breed"))
   value.breed
 end
 

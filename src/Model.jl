@@ -1139,6 +1139,21 @@ function set_turtle_breed!(world::World, turtle::Turtle, breed::AbstractString)
   turtle
 end
 
+function set_link_breed!(world::World, link::Link, breed::AbstractString)
+  canonical = canonical_name(breed)
+  canonical == "LINKS" || has_link_breed(world.model, canonical) ||
+    throw(LogoRuntimeError("unknown link breed $breed"))
+  old_breed = link.breed
+  new_own = default_link_own(world, canonical)
+  for (name, value) in link.own
+    haskey(new_own, name) && (new_own[name] = copy_logo_slot_value(value))
+  end
+  link.breed = canonical
+  link.own = new_own
+  canonical != old_breed && (link.shape = default_link_shape(world, canonical))
+  link
+end
+
 function existing_link(world::World, end1::Turtle, end2::Turtle, breed::String; directed::Union{Nothing, Bool}=nothing)
   canonical = canonical_name(breed)
   for link in world.links

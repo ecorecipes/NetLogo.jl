@@ -269,6 +269,7 @@ export AgentKind,
   pluto_gui,
   press_gui_button!,
   register_primitive!,
+  run_commands!,
   runresult,
   set_gui_widget!,
   start_web_gui,
@@ -316,6 +317,18 @@ Evaluate a NetLogo reporter expression string and return the result.
 function runresult(runtime::RuntimeState, source::AbstractString)
   ctx = Context(runtime, runtime.world.observer, EMPTY_SCOPE_STACK, nothing, false, 1, EMPTY_EVERY_STATE)
   runresult_string(ctx, source)
+end
+
+"""
+    run_commands!(runtime, command_string)
+
+Compile and execute an arbitrary NetLogo command string (one or more statements)
+in the observer context. This is the command analogue of `runresult`.
+"""
+function run_commands!(runtime::RuntimeState, source::AbstractString)
+  ctx = Context(runtime, runtime.world.observer, EMPTY_SCOPE_STACK, nothing, false, 1, EMPTY_EVERY_STATE)
+  run_string!(ctx, source)
+  nothing
 end
 
 macro netlogo_str(source)

@@ -1765,8 +1765,21 @@ function parse_command_task(stream::TokenStream, model::ModelSpec, registry::Pri
     end
     return parse_command_task_literal(stream, model, registry, scope)
   elseif token.kind == IdentifierToken || token.kind == OperatorToken
+    name = canonical_name(token.lexeme)
+    # If the identifier is a variable, always parse as expression
+    if identifier_is_variable_like(name, model, scope)
+      return parse_expression(stream, model, registry, scope, 0)
+    end
+    # If the identifier is at the end of the statement (followed by a terminator),
+    # treat it as a callable reference (e.g., `foreach list run`)
+    saved = stream.index
     advance!(stream)
-    return CallableRefNode(canonical_name(token.lexeme), token.span)
+    nxt = peek(stream)
+    if nxt.kind in (EofToken, NewlineToken, RBracketToken, RParenToken)
+      return CallableRefNode(name, token.span)
+    end
+    # Otherwise, it might be a multi-arg reporter/command; parse as expression
+    stream.index = saved
   end
   parse_expression(stream, model, registry, scope, 0)
 end
@@ -2037,6 +2050,9 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
       append!(modes, fill(:eval, length(spec.syntax.right) - length(modes)))
     end
 
+    # OF is right-associative so chained `[x] of [y] of z` parses as `[x] of ([y] of z)`
+    right_min_prec = op_name == "OF" ? spec.syntax.precedence : spec.syntax.precedence + 1
+
     args = Any[left]
     skip_newlines!(stream)
     for (index, mask) in enumerate(spec.syntax.right)
@@ -2044,7 +2060,7 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
       mode = effective_arg_mode(mask, modes[index])
       if is_repeatable(mask)
         while can_start_argument(stream, bare_mask, model, registry)
-          push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, spec.syntax.precedence + 1))
+          push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, right_min_prec))
           check(stream, NewlineToken) && break
           skip_newlines!(stream)
         end
@@ -2052,7 +2068,7 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
       elseif is_optional(mask) && !can_start_argument(stream, bare_mask, model, registry)
         continue
       end
-      push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, spec.syntax.precedence + 1))
+      push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, right_min_prec))
       # Only skip newlines between arguments, not after the last one;
       # the main expression loop handles newline continuation decisions.
       if index < length(spec.syntax.right)
