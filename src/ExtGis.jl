@@ -178,6 +178,7 @@ function _extract_all_vertices(geom)::Vector{GisVertex}
 end
 
 function _compute_dataset_envelope(features::Vector{GisVectorFeature})
+  isempty(features) && return (0.0, 0.0, 0.0, 0.0)
   xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
   for f in features
     env = _feature_envelope(f)
@@ -219,6 +220,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════════
 
 function _envelope_of_points(points)
+  isempty(points) && return (0.0, 0.0, 0.0, 0.0)
   xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
   for p in points
     x, y = _point_coords(p)
@@ -1595,19 +1597,19 @@ function register_extension!(registry::PrimitiveRegistry)
 
   register_primitive!(registry, "GIS:DRAW", COMMAND,
     command_syntax(right=[WildcardType, NumberType]),
-    (ctx, args) -> nothing)  # no-op in headless
+    (ctx, args) -> throw(LogoRuntimeError("gis:draw is not supported in headless mode")))
 
   register_primitive!(registry, "GIS:FILL", COMMAND,
     command_syntax(right=[WildcardType, NumberType]),
-    (ctx, args) -> nothing)  # no-op in headless
+    (ctx, args) -> throw(LogoRuntimeError("gis:fill is not supported in headless mode")))
 
   register_primitive!(registry, "GIS:PAINT", COMMAND,
     command_syntax(right=[WildcardType, NumberType]),
-    (ctx, args) -> nothing)  # no-op in headless
+    (ctx, args) -> throw(LogoRuntimeError("gis:paint is not supported in headless mode")))
 
   register_primitive!(registry, "GIS:IMPORT-WMS-DRAWING", COMMAND,
     command_syntax(right=[StringType, StringType, NumberType]),
-    (ctx, args) -> nothing)  # no-op in headless
+    (ctx, args) -> throw(LogoRuntimeError("gis:import-wms-drawing is not supported in headless mode")))
 
   # ── Turtle/Patch Dataset Creation ──────────────────────────────────────
   register_primitive!(registry, "GIS:TURTLE-DATASET", REPORTER,

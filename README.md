@@ -116,6 +116,7 @@ The comparison harness in `eval/` can run smoke tests, single-batch comparisons,
 ```bash
 julia --project=. eval/run_comparison.jl julia-only
 julia --project=. eval/run_comparison.jl calibrated sir 30
+julia --project=. eval/benchmark.jl components 50 20
 ```
 
 ## Development

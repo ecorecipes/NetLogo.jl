@@ -90,7 +90,7 @@ function register_extension!(registry::PrimitiveRegistry)
     (ctx, args) -> begin
       count = round(Int, args[1])
       path = String(args[2])
-      resolved = resolve_file_path(path)
+      resolved = resolve_file_path(path, ctx.runtime)
       isfile(resolved) || throw(LogoRuntimeError(
         "ls:create-models: file not found: $resolved"))
       source = read(resolved, String)
@@ -110,7 +110,7 @@ function register_extension!(registry::PrimitiveRegistry)
     (ctx, args) -> begin
       count = round(Int, args[1])
       path = String(args[2])
-      resolved = resolve_file_path(path)
+      resolved = resolve_file_path(path, ctx.runtime)
       isfile(resolved) || throw(LogoRuntimeError(
         "ls:create-interactive-models: file not found: $resolved"))
       source = read(resolved, String)

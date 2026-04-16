@@ -10,7 +10,7 @@ const NL7_DIR = joinpath(dirname(@__DIR__), "..", "NetLogo-dist", "NetLogo 7.0.3
 const NL6_DIR = joinpath(dirname(@__DIR__), "..", "NetLogo-dist", "NetLogo-6.4.0-64", "models", "Sample Models")
 
 # Extensions we don't support
-const UNSUPPORTED_EXTS = Set(["import-a", "resource", "palette", "ls", "vid", "py", "r", "fetch", "send-to", "web"])
+const UNSUPPORTED_EXTS = Set(["import-a", "resource", "ls", "vid", "py", "r", "fetch", "send-to", "web"])
 
 # Models to skip (known issues: HubNet, __includes, interactive-only, etc.)
 const SKIP_MODELS = Set([
@@ -21,7 +21,6 @@ const SKIP_MODELS = Set([
     "Biology/CRISPR/CRISPR Bacterium LevelSpace",
     "Biology/CRISPR/CRISPR Ecosystem LevelSpace",
     "Chemistry & Physics/Kicked Rotators",  # ls extension
-    "Chemistry & Physics/Gas Chromatography",  # hangs in setup
 ])
 
 const GO_STEPS = 5

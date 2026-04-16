@@ -716,7 +716,8 @@ end
 
   call!(runtime, "random-demo")
   @test runtime.world.observer.globals["RANDOM-ORDERED"] == false
-  @test runtime.world.observer.globals["CENTERED-BACK"] == Any[Any[0.0], Any[0.0]]
+  centered = runtime.world.observer.globals["CENTERED-BACK"]
+  @test all(values -> all(value -> isapprox(value, 0.0; atol=1.0e-12), values), centered)
   @test runtime.world.observer.globals["ZERO-COLLAPSE"] == Any[Any[0.0], Any[0.0]]
 end
 

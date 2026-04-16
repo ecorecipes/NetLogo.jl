@@ -5,6 +5,7 @@ Headless-first, clean-room Julia implementation of the NetLogo language and runt
 """
 module NetLogo
 
+using CSV: CSV as CSVLib
 using Colors
 using Dates
 using EzXML
@@ -35,6 +36,7 @@ include("ExtStore.jl")
 include("ExtRnd.jl")
 include("ExtTime.jl")
 include("ExtBitstring.jl")
+include("ExtPalette.jl")
 include("GUI.jl")
 
 @doc raw"""

@@ -14,8 +14,10 @@ Usage:
   julia --project=. eval/benchmark.jl sir 10
   julia --project=. eval/benchmark.jl all 5
   julia --project=. eval/benchmark.jl profile sir    # Profile a single model
+  julia --project=. eval/benchmark.jl components 50 20  # Team Assembly CC vignette
 """
 
+using Graphs
 using Printf
 using Statistics
 using Profile
@@ -207,6 +209,130 @@ function format_time(seconds::Float64)
     end
 end
 
+# ─── Team Assembly connected-component vignette ───────────────────────
+
+function teamassembly_runtime(compiled, runtime_fn, call_fn, topology_mode; seed::Int=1, ticks::Int=50)
+    model = TeamAssemblyModel()
+    min_px, max_px, min_py, max_py = world_dims(model)
+    rt = Base.invokelatest(runtime_fn, compiled; seed=seed,
+                    min_pxcor=min_px, max_pxcor=max_px,
+                    min_pycor=min_py, max_pycor=max_py,
+                    topology=topology_mode)
+    Base.invokelatest(call_fn, rt, "setup")
+    for _ in 1:ticks
+        Base.invokelatest(call_fn, rt, "go")
+    end
+    rt
+end
+
+function live_team_turtles(world)
+    turtles = eltype(world.turtles)[]
+    sizehint!(turtles, length(world.turtles))
+    for turtle in world.turtles
+        turtle.alive && push!(turtles, turtle)
+    end
+    turtles
+end
+
+function team_component_sizes_bespoke(world)
+    turtles = live_team_turtles(world)
+    isempty(turtles) && return Int[]
+    id_to_index = Dict{Int, Int}(turtle.id => i for (i, turtle) in enumerate(turtles))
+    seen = falses(length(turtles))
+    queue = Int[]
+    sizes = Int[]
+    sizehint!(sizes, length(turtles))
+
+    for start in eachindex(turtles)
+        seen[start] && continue
+        empty!(queue)
+        push!(queue, start)
+        seen[start] = true
+        size = 0
+        head = 1
+        while head <= length(queue)
+            current_index = queue[head]
+            head += 1
+            size += 1
+            turtle = turtles[current_index]
+            for link in get(world.turtle_links, turtle.id, eltype(world.links)[])
+                link.alive || continue
+                neighbor_id = link.end1 == turtle.id ? link.end2 : link.end1
+                neighbor_index = get(id_to_index, neighbor_id, 0)
+                neighbor_index == 0 && continue
+                seen[neighbor_index] && continue
+                seen[neighbor_index] = true
+                push!(queue, neighbor_index)
+            end
+        end
+        push!(sizes, size)
+    end
+
+    sort!(sizes)
+end
+
+function team_component_sizes_graphs(world)
+    turtles = live_team_turtles(world)
+    n = length(turtles)
+    n == 0 && return Int[]
+    id_to_index = Dict{Int, Int}(turtle.id => i for (i, turtle) in enumerate(turtles))
+    g = Graphs.SimpleGraph(n)
+    for link in world.links
+        link.alive || continue
+        src = get(id_to_index, link.end1, 0)
+        dst = get(id_to_index, link.end2, 0)
+        (src == 0 || dst == 0 || src == dst) && continue
+        Graphs.add_edge!(g, src, dst)
+    end
+    sort!([length(component) for component in Graphs.connected_components(g)])
+end
+
+function team_component_sizes_interpreter!(rt, call_fn)
+    Base.invokelatest(call_fn, rt, "find-all-components")
+    raw_sizes = rt.world.observer.globals["COMPONENTS"]
+    sort!(Int[round(Int, Float64(size)) for size in raw_sizes])
+end
+
+function component_vignette(; ticks::Int=50, reps::Int=20, seed::Int=1)
+    NetLogo = Base.require(Main, :NetLogo)
+    compile_fn = getfield(NetLogo, :compile_model)
+    runtime_fn = getfield(NetLogo, :create_runtime)
+    call_fn = getfield(NetLogo, Symbol("call!"))
+    topology_mode = NetLogoCompare.runtime_topology_mode(NetLogo, TeamAssemblyModel())
+    compiled = Base.invokelatest(compile_fn, netlogo_code(TeamAssemblyModel()))
+    rt = teamassembly_runtime(compiled, runtime_fn, call_fn, topology_mode; seed=seed, ticks=ticks)
+
+    interpreter_sizes = team_component_sizes_interpreter!(rt, call_fn)
+    bespoke_sizes = team_component_sizes_bespoke(rt.world)
+    graphs_sizes = team_component_sizes_graphs(rt.world)
+
+    interpreter_sizes == bespoke_sizes || error("Interpreter and bespoke component sizes diverged: $interpreter_sizes vs $bespoke_sizes")
+    bespoke_sizes == graphs_sizes || error("Bespoke and Graphs.jl component sizes diverged: $bespoke_sizes vs $graphs_sizes")
+
+    interp_t = @elapsed for _ in 1:reps
+        team_component_sizes_interpreter!(rt, call_fn)
+    end
+    bespoke_t = @elapsed for _ in 1:reps
+        team_component_sizes_bespoke(rt.world)
+    end
+    graphs_t = @elapsed for _ in 1:reps
+        team_component_sizes_graphs(rt.world)
+    end
+
+    println("╔════════════════════════════════════════════════════════════════════╗")
+    println("║  Team Assembly Connected-Components Vignette                      ║")
+    @printf("║  Tick snapshot: %-3d  │  Repetitions: %-3d  │  Seed: %-3d                 ║\n", ticks, reps, seed)
+    println("╚════════════════════════════════════════════════════════════════════╝\n")
+    println("Component sizes: ", interpreter_sizes)
+    println("Giant component: ", isempty(interpreter_sizes) ? 0 : last(interpreter_sizes))
+    println()
+    @printf("%-18s %12s %12s\n", "Implementation", "Total", "Per run")
+    println("─"^44)
+    @printf("%-18s %12s %12s\n", "Interpreter", format_time(interp_t), format_time(interp_t / reps))
+    @printf("%-18s %12s %12s\n", "Bespoke BFS", format_time(bespoke_t), format_time(bespoke_t / reps))
+    @printf("%-18s %12s %12s\n", "Graphs.jl", format_time(graphs_t), format_time(graphs_t / reps))
+end
+
 # ─── Profile mode ───────────────────────────────────────────────────
 
 function profile_model(model::AbstractBenchmarkModel; seed::Int=1)
@@ -374,6 +500,12 @@ function main()
         model_name_arg = length(args) >= 2 ? args[2] : "sir"
         haskey(MODELS, model_name_arg) || error("Unknown model: $model_name_arg")
         profile_model(MODELS[model_name_arg])
+        return
+    elseif length(args) >= 1 && args[1] == "components"
+        ticks = length(args) >= 2 ? parse(Int, args[2]) : 50
+        reps = length(args) >= 3 ? parse(Int, args[3]) : 20
+        seed = length(args) >= 4 ? parse(Int, args[4]) : 1
+        component_vignette(; ticks=ticks, reps=reps, seed=seed)
         return
     end
 

@@ -7,7 +7,7 @@ using ..NetLogo: PrimitiveRegistry, register_primitive!, REPORTER, COMMAND,
   LogoRuntimeError, World, Turtle, Link, Context,
   live_agentset_members, collection_member, maybe_turtle_by_id,
   logo_equal, AbstractAgent, AgentSet, TurtleKind, LinkKind, BlockNode,
-  create_turtle!, create_link!, run_block_for_agents!,
+  create_turtle!, create_link!, kill_link!, run_block_for_agents!,
   all_turtles, all_links
 
 import Graphs
@@ -908,7 +908,7 @@ function nw_generate_small_world(ctx::Context, turtleset, linkset, rows::Int, co
       isempty(candidates) && continue
       target = candidates[rand(world.rng, 1:length(candidates))]
       # Remove old link and create new one
-      link.alive = false
+      kill_link!(world, link)
       nw_make_link!(world, nodes[src_idx], target, link_breed)
     end
   end
@@ -1329,7 +1329,7 @@ function nw_generate_watts_strogatz(ctx::Context, turtleset, linkset, num_nodes:
               !link.alive && continue
               if (link.end1 == turtles[i].id && link.end2 == turtles[j].id) ||
                  (link.end1 == turtles[j].id && link.end2 == turtles[i].id)
-                link.alive = false
+                kill_link!(world, link)
                 break
               end
             end

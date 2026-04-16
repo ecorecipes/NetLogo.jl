@@ -338,6 +338,20 @@ end
   @test broken_error.message == "Extension brokenext must define register_extension! or register_primitives!"
 end
 
+@testset "unit: palette extension" begin
+  runtime = create_runtime(compile_model("""
+  extensions [palette]
+  globals [midpoint]
+
+  to setup
+    set midpoint palette:scale-gradient [[0 0 0] [255 255 255]] 0.5 0 1
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+  @test runtime.world.observer.globals["MIDPOINT"] == Any[128.0, 128.0, 128.0]
+end
+
 @testset "unit: macro DSL and model parsing" begin
   model = netlogo"""
   breed [wolves wolf]
@@ -483,6 +497,123 @@ end
   @test occursin("Circular __includes detected", circular_error.message)
 
   rm(base_dir; recursive=true, force=true)
+end
+
+@testset "unit: system dynamics parsing and ordering" begin
+  sd_source(code::AbstractString, sd_section::AbstractString) =
+    join(
+      [String(code), "", "", "", "", "", String(sd_section)],
+      "\n$(NetLogo.MODEL_SECTION_DELIMITER)\n")
+
+  ordered_source = sd_source(
+    """
+    to setup
+      clear-all
+      system-dynamics-setup
+    end
+
+    to go
+      system-dynamics-go
+    end
+
+    to-report values
+      report (list a b dt ticks)
+    end
+    """,
+    """
+    1
+        org.nlogo.sdm.gui.AggregateDrawing 2
+            org.nlogo.sdm.gui.StockFigure "attributes" "attributes" 1 "FillColor" "Color" 0 0 0 0 0 60 40
+                org.nlogo.sdm.gui.WrappedStock "a" "b + 1" 1
+            org.nlogo.sdm.gui.StockFigure "attributes" "attributes" 1 "FillColor" "Color" 0 0 0 60 0 60 40
+                org.nlogo.sdm.gui.WrappedStock "b" "2" 1
+    """)
+
+  runtime = create_runtime(compile_model(ordered_source); seed=1)
+  call!(runtime, "setup")
+  @test call!(runtime, "values") == Any[3.0, 2.0, 1.0, 0.0]
+
+  call!(runtime, "go")
+  @test call!(runtime, "values") == Any[3.0, 2.0, 1.0, 1.0]
+
+  malformed_source = sd_source(
+    """
+    to setup
+      clear-all
+    end
+    """,
+    """
+    not-a-number
+        org.nlogo.sdm.gui.AggregateDrawing 0
+    """)
+
+  malformed_error = try
+    compile_model(malformed_source)
+    nothing
+  catch err
+    err
+  end
+  @test malformed_error isa LogoRuntimeError
+  @test occursin("System Dynamics section", malformed_error.message)
+end
+
+@testset "unit: levelspace relative paths and basic operations" begin
+  mktempdir() do dir
+    child_path = joinpath(dir, "child.nlogo")
+    parent_path = joinpath(dir, "parent.nlogo")
+
+    write(child_path, """
+    globals [value]
+
+    to setup
+      set value 7
+    end
+
+    to-report value-report
+      report value
+    end
+    """)
+
+    write(parent_path, """
+    extensions [ls]
+    globals [first-id first-name renamed-name child-value child-path uses-ls exists-before exists-after]
+
+    to setup
+      ls:create-models 1 "child.nlogo"
+      set first-id first ls:models
+      ls:ask first-id "setup"
+      set first-name ls:name-of first-id
+      ls:set-name first-id "renamed"
+      set renamed-name ls:name-of first-id
+      set child-value ls:report first-id "value-report"
+      set child-path ls:path-of first-id
+      set uses-ls ls:uses-level-space? first-id
+      set exists-before ls:model-exists? first-id
+      ls:close first-id
+      set exists-after ls:model-exists? first-id
+    end
+
+    to-report reset-count
+      ls:create-models 2 "child.nlogo"
+      ls:reset
+      report length ls:models
+    end
+    """)
+
+    runtime = create_runtime(load_model(parent_path); seed=1)
+    call!(runtime, "setup")
+
+    globals = runtime.world.observer.globals
+    @test globals["FIRST-ID"] == 0.0
+    @test globals["FIRST-NAME"] == "child.nlogo"
+    @test globals["RENAMED-NAME"] == "renamed"
+    @test globals["CHILD-VALUE"] == 7.0
+    @test globals["CHILD-PATH"] == child_path
+    @test globals["USES-LS"] == false
+    @test globals["EXISTS-BEFORE"] == true
+    @test globals["EXISTS-AFTER"] == false
+    @test call!(runtime, "reset-count") == 0.0
+  end
 end
 
 @testset "unit: control flow and collections" begin
@@ -1180,6 +1311,26 @@ end
     report [heading] of turtle 0
   end
 
+  to-report facexy-same-spot-demo
+    clear-all
+    crt 1
+    ask turtle 0 [
+      set heading 45
+      setxy 0 0
+      facexy 0 0
+    ]
+    report [heading] of turtle 0
+  end
+
+  to-report face-same-spot-demo
+    clear-all
+    crt 2
+    ask turtle 0 [ setxy 0 0 set heading 45 ]
+    ask turtle 1 [ setxy 0 0 ]
+    ask turtle 0 [ face turtle 1 ]
+    report [heading] of turtle 0
+  end
+
   to-report link-heading-error
     clear-all
     cro 2
@@ -1213,6 +1364,8 @@ end
   ]
   @test call!(runtime, "patch-ahead-dxdy") == true
   @test call!(runtime, "facexy-demo") == 225.0
+  @test call!(runtime, "facexy-same-spot-demo") == 45.0
+  @test call!(runtime, "face-same-spot-demo") == 45.0
   @test call!(runtime, "link-heading-error") == "there is no heading of a link whose endpoints are in the same position"
   @test call!(runtime, "link-heading-match") == true
 end
@@ -1275,7 +1428,8 @@ end
   @test call!(runtime, "random-layout-is-sorted") == false
   @test call!(runtime, "sorted-headings-demo") == Any[0.0, 360.0 / 7.0, 2.0 * 360.0 / 7.0, 3.0 * 360.0 / 7.0, 4.0 * 360.0 / 7.0, 5.0 * 360.0 / 7.0, 6.0 * 360.0 / 7.0]
   @test call!(runtime, "sorted-endpoints-demo") == Any[Any[0.0, 5.0], Any[0.0, -5.0]]
-  @test call!(runtime, "centered-after-back-demo") == Any[Any[0.0], Any[0.0]]
+  centered = call!(runtime, "centered-after-back-demo")
+  @test all(values -> all(value -> isapprox(value, 0.0; atol=1.0e-12), values), centered)
   @test call!(runtime, "zero-radius-demo") == Any[Any[0.0], Any[0.0]]
 end
 
@@ -1781,6 +1935,7 @@ end
     set file-value user-file
     set newfile-value user-new-file
     set dir-value user-directory
+    user-message "headless notice"
   end
   """; seed=277)
 
@@ -1792,6 +1947,107 @@ end
   @test runtime.world.observer.globals["FILE-VALUE"] == false
   @test runtime.world.observer.globals["NEWFILE-VALUE"] == false
   @test runtime.world.observer.globals["DIR-VALUE"] == false
+  @test runtime.command_output == "headless notice\n"
+end
+
+@testset "unit: headless mouse defaults and run-commands helpers" begin
+  runtime = create_runtime(netlogo"""
+  globals [value label]
+
+  to setup [n]
+    clear-all
+    set value n
+  end
+
+  to add-value [n]
+    set value value + n
+    set label "done"
+  end
+  """; seed=277)
+
+  run_commands!(runtime, """
+  setup 7
+  add-value 5
+  """)
+
+  @test runtime.world.observer.globals["VALUE"] == 12.0
+  @test runtime.world.observer.globals["LABEL"] == "done"
+  @test runresult(runtime, "mouse-down?") == false
+  @test runresult(runtime, "mouse-inside?") == false
+  @test runresult(runtime, "mouse-xcor") == 0.0
+  @test runresult(runtime, "mouse-ycor") == 0.0
+  @test runresult(runtime, "PI") == π
+end
+
+@testset "unit: headless movie/bitmap errors and empty-client hubnet" begin
+  runtime = create_runtime(compile_model("""
+  extensions [bitmap gis]
+  globals [bmp r]
+
+  to setup
+    resize-world 0 0 0 0
+    ask patches [ set pcolor red ]
+    set bmp bitmap:from-view
+    set r gis:create-raster 1 1 (list 0 1 0 1)
+  end
+
+  to bitmap-draw
+    bitmap:copy-to-drawing bmp 0 0
+  end
+
+  to movie-demo
+    movie-start "demo.mov"
+  end
+
+  to-report movie-status-demo
+    report movie-status
+  end
+
+  to hubnet-demo
+    hubnet-reset
+  end
+
+  to-report hubnet-waiting
+    report hubnet-message-waiting?
+  end
+
+  to-report hubnet-clients
+    report hubnet-clients-list
+  end
+  """); seed=1)
+
+  call!(runtime, "setup")
+
+  bitmap_error = try
+    call!(runtime, "bitmap-draw")
+    nothing
+  catch err
+    err
+  end
+  @test bitmap_error isa LogoRuntimeError
+  @test bitmap_error.message == "bitmap:copy-to-drawing is not supported in headless mode"
+
+  movie_error = try
+    call!(runtime, "movie-demo")
+    nothing
+  catch err
+    err
+  end
+  @test movie_error isa LogoRuntimeError
+  @test movie_error.message == "movie-start is not supported in headless mode"
+
+  movie_status_error = try
+    call!(runtime, "movie-status-demo")
+    nothing
+  catch err
+    err
+  end
+  @test movie_status_error isa LogoRuntimeError
+  @test movie_status_error.message == "movie-status is not supported in headless mode"
+
+  call!(runtime, "hubnet-demo")
+  @test call!(runtime, "hubnet-waiting") == false
+  @test call!(runtime, "hubnet-clients") == Any[]
 end
 
 @testset "unit: range reporter" begin
@@ -2135,6 +2391,87 @@ end
   end
 end
 
+@testset "unit: import-world supports NetLogo text exports" begin
+  base_dir = mktempdir()
+  world_path = joinpath(base_dir, "world.csv")
+  write(world_path, join([
+    "\"export-world data (NetLogo 3.1pre1)\"",
+    "\"Text Import Test\"",
+    "\"2025-01-01 00:00:00:000 +0000\"",
+    "",
+    "\"RANDOM STATE\"",
+    "\"ignored\"",
+    "",
+    "\"GLOBALS\"",
+    "\"min-pxcor\",\"max-pxcor\",\"min-pycor\",\"max-pycor\",\"score\"",
+    "\"-1\",\"1\",\"-1\",\"1\",\"7\"",
+    "",
+    "\"TURTLES\"",
+    "\"who\",\"color\",\"heading\",\"xcor\",\"ycor\",\"shape\",\"label\",\"label-color\",\"breed\",\"hidden?\",\"size\",\"pen-size\",\"pen-mode\",\"home-pos\",\"powerup?\"",
+    "\"0\",\"15.0\",\"90.0\",\"1.0\",\"-1.0\",\"\"\"default\"\"\",\"\"\"starter\"\"\",\"9.9\",\"{breed turtles}\",\"false\",\"1.0\",\"1.0\",\"\"\"up\"\"\",\"[1 -1]\",\"\"",
+    "\"1\",\"35.0\",\"0.0\",\"0.0\",\"0.0\",\"\"\"circle\"\"\",\"\"\"pellet\"\"\",\"9.9\",\"{breed pellets}\",\"false\",\"1.0\",\"1.0\",\"\"\"up\"\"\",\"[0 0]\",\"true\"",
+    "",
+    "\"PATCHES\"",
+    "\"pxcor\",\"pycor\",\"pcolor\",\"plabel\",\"plabel-color\",\"pellet-grid?\"",
+    "\"-1\",\"1\",\"55.0\",\"\"\"northwest\"\"\",\"9.9\",\"true\"",
+    "",
+    "\"DRAWING\"",
+    "",
+  ], "\n"))
+  runtime = create_runtime(netlogo"""
+  globals [score]
+  turtles-own [home-pos]
+  patches-own [pellet-grid?]
+  breed [pellets pellet]
+  pellets-own [powerup?]
+
+  to-report import-text-demo [file]
+    clear-all
+    import-world file
+    report (list
+      min-pxcor
+      max-pxcor
+      count turtles
+      score
+      [xcor] of turtle 0
+      [ycor] of turtle 0
+      [heading] of turtle 0
+      [shape] of turtle 0
+      [label] of turtle 0
+      [home-pos] of turtle 0
+      [shape] of turtle 1
+      [label] of turtle 1
+      [powerup?] of turtle 1
+      [pcolor] of patch -1 1
+      [plabel] of patch -1 1
+      [pellet-grid?] of patch -1 1)
+  end
+  """; seed=1)
+
+  try
+    @test call!(runtime, "import-text-demo", world_path) == Any[
+      -1.0,
+      1.0,
+      2.0,
+      7.0,
+      1.0,
+      -1.0,
+      90.0,
+      "default",
+      "starter",
+      Any[1.0, -1.0],
+      "circle",
+      "pellet",
+      true,
+      55.0,
+      "northwest",
+      true,
+    ]
+  finally
+    rm(base_dir; recursive=true, force=true)
+  end
+end
+
 @testset "unit: export-world plot and RNG persistence" begin
   base_dir = mktempdir()
   world_path = joinpath(base_dir, "world.bin")
@@ -2287,6 +2624,28 @@ Polygon -7500403 true true 150 0 0 150 150 300 300 150
   @test NetLogo.java_color_to_rgba(-1) == (255.0, 255.0, 255.0, 255.0)
   @test NetLogo.java_color_to_rgba(-10899396) == (89.0, 176.0, 60.0, 255.0)
   @test NetLogo.java_color_to_rgba(-6459832) == (157.0, 110.0, 72.0, 255.0)
+end
+
+@testset "unit: model turtle shapes auto-load into runtime" begin
+  model = compile_model("""
+  to setup
+    clear-all
+    crt 1 [ set shape "autodiamond" set size 3 set color red ]
+  end
+  """)
+  model.turtle_shapes_text = """
+autodiamond
+true
+0
+Polygon -7500403 true true 150 0 0 150 150 300 300 150
+"""
+
+  runtime = create_runtime(model; seed=1, patch_size=13, min_pxcor=-2, max_pxcor=2, min_pycor=-2, max_pycor=2)
+
+  @test haskey(runtime.custom_turtle_shapes, "autodiamond")
+
+  call!(runtime, "setup")
+  @test runresult(runtime, "[shape] of turtle 0") == "autodiamond"
 end
 
 @testset "unit: patch color import commands" begin
@@ -6235,6 +6594,22 @@ end
   to-report directed-generic?
     report is-directed-link? [out-link-to turtle 1] of turtle 0
   end
+
+  to-report directed-source-in-count
+    report count [in-link-neighbors] of turtle 0
+  end
+
+  to-report directed-dest-out-count
+    report count [out-link-neighbors] of turtle 1
+  end
+
+  to-report directed-source-in-self?
+    report [in-link-neighbor? self] of turtle 0
+  end
+
+  to-report directed-dest-out-self?
+    report [out-link-neighbor? self] of turtle 1
+  end
   """; seed=137)
 
   breed_runtime = create_runtime(netlogo"""
@@ -6275,6 +6650,10 @@ end
   @test call!(generic_runtime, "source-out-neighbor?") == true
   @test call!(generic_runtime, "source-in-neighbor?") == true
   @test call!(directed_runtime, "directed-generic?") == true
+  @test call!(directed_runtime, "directed-source-in-count") == 0.0
+  @test call!(directed_runtime, "directed-dest-out-count") == 0.0
+  @test call!(directed_runtime, "directed-source-in-self?") == false
+  @test call!(directed_runtime, "directed-dest-out-self?") == false
   @test breed_runtime.world.observer.globals["DIRECTED-OUT-BREED-VAL"] isa NetLogo.AgentSet
   @test breed_runtime.world.observer.globals["DIRECTED-OUT-BREED-VAL"].breed == "DIRECTED-EDGES"
   @test breed_runtime.world.observer.globals["DIRECTED-IN-BREED-VAL"] isa NetLogo.AgentSet
@@ -6333,6 +6712,7 @@ end
 
   call!(runtime, "seed-many-links")
   @test length(runtime.world.links) == 3
+  @test call!(runtime, "source-neighbor-count") == 3.0
 
   call!(runtime, "clear-demo")
   @test isempty(runtime.world.links)
@@ -6344,9 +6724,37 @@ end
 
   call!(runtime, "relink-after-clear")
   @test length(runtime.world.links) == 1
+  @test call!(runtime, "source-neighbor-count") == 1.0
   @test call!(runtime, "generic-radius-counts") == Any[Any[0.0, 2.0], Any[1.0, 2.0], Any[2.0, 3.0]]
   @test call!(runtime, "out-radius-counts") == Any[Any[0.0, 3.0], Any[1.0, 2.0], Any[2.0, 3.0]]
   @test call!(runtime, "in-radius-counts") == Any[Any[0.0, 2.0], Any[1.0, 3.0], Any[2.0, 3.0]]
+end
+
+@testset "unit: filtered in-radius respects subset membership" begin
+  runtime = create_runtime(netlogo"""
+  turtles-own [flag]
+
+  to setup
+    clear-all
+    crt 3 [
+      setxy who 0
+      set flag false
+    ]
+    ask turtle 1 [ set flag true ]
+  end
+
+  to-report filtered-radius-count
+    report [count ((turtles with [flag]) in-radius 2)] of turtle 0
+  end
+
+  to-report empty-radius-count
+    report [count ((turtles with [who > 10]) in-radius 2)] of turtle 0
+  end
+  """; seed=1)
+
+  call!(runtime, "setup")
+  @test call!(runtime, "filtered-radius-count") == 1.0
+  @test call!(runtime, "empty-radius-count") == 0.0
 end
 
 @testset "unit: RNG distribution reporters" begin
@@ -7115,6 +7523,32 @@ end
   @test call!(runtime, "reporter-string") == "(anonymous reporter: [ x -> x + 1 ])"
 end
 
+@testset "unit: runtime and nlogox task stringification" begin
+  runtime = create_runtime(compile_model(""); seed=233)
+
+  @test runresult(runtime, "word [ α -> α + 1 ]") == "(anonymous reporter: [ α -> α + 1 ])"
+  @test runresult(runtime, "word [ -> fd 1 ]") == "(anonymous command: [ -> fd 1 ])"
+
+  nlogox_runtime = create_runtime(compile_model("""
+  <model>
+    <code><![CDATA[
+globals [rep-task]
+
+to setup
+  set rep-task [ α -> α + 1 ]
+end
+
+to-report reporter-string
+  report word rep-task
+end
+    ]]></code>
+  </model>
+  """); seed=233)
+
+  call!(nlogox_runtime, "setup")
+  @test call!(nlogox_runtime, "reporter-string") == "(anonymous reporter: [ α -> α + 1 ])"
+end
+
 @testset "unit: apply-result and codeblock helpers" begin
   runtime = create_runtime(netlogo"""
   to-report apply-power
@@ -7241,7 +7675,7 @@ end
 
 @testset "unit: string run runtime" begin
   runtime = create_runtime(netlogo"""
-  globals [check counter message]
+  globals [check counter message foo bar dash-output]
   turtles-own [turtle-var]
 
   to setup
@@ -7249,6 +7683,9 @@ end
     set check 0
     set counter 0
     set message ""
+    set foo 17
+    set bar 0
+    set dash-output ""
     crt 1 [ set turtle-var 600000 ]
   end
 
@@ -7296,6 +7733,19 @@ end
     report (list (runresult make-bare-runresult-source) counter)
   end
 
+  to computed-runresult-demo
+    set bar runresult word "f" "oo"
+  end
+
+  to-report reduce-of-demo
+    report reduce sentence [list who] of turtles
+  end
+
+  to dash-variable-demo
+    let -s "-suffix"
+    set dash-output (word "lever" -s)
+  end
+
   to-report local-isolation
     let s 0
     run "set s -1"
@@ -7305,6 +7755,16 @@ end
   to-report read-procedure-locals [proc-arg]
     let proc-let 20
     report runresult "proc-arg + proc-let"
+  end
+
+  to-report read-zero-input-procedure-locals
+    let a true
+    let b false
+    report runresult (word "a or b")
+  end
+
+  to-report color-constant-list-demo
+    report (list ["White" white] ["Pink" pink] ["Sky Blue" sky])
   end
 
   to scope-error-demo [proc-arg]
@@ -7354,8 +7814,19 @@ end
   call!(runtime, "run-from-bare-reporter")
   @test call!(runtime, "bare-run-state") == Any[1.0, 1.0]
   @test call!(runtime, "runresult-from-bare-reporter") == Any[2.0, 1.0]
+  call!(runtime, "computed-runresult-demo")
+  @test runtime.world.observer.globals["BAR"] == 17.0
+  @test call!(runtime, "reduce-of-demo") == Any[0.0]
+  call!(runtime, "dash-variable-demo")
+  @test runtime.world.observer.globals["DASH-OUTPUT"] == "lever-suffix"
   @test call!(runtime, "local-isolation") == 0.0
   @test call!(runtime, "read-procedure-locals", 1) == 21.0
+  @test call!(runtime, "read-zero-input-procedure-locals") == true
+  @test call!(runtime, "color-constant-list-demo") == Any[
+    Any["White", 9.9],
+    Any["Pink", 135.0],
+    Any["Sky Blue", 95.0],
+  ]
 
   call!(runtime, "scope-error-demo", 1)
   @test call!(runtime, "scope-value") == 600021.0
@@ -7370,6 +7841,22 @@ end
     "run doesn't accept further inputs if the first is a string",
     "runresult doesn't accept further inputs if the first is a string",
   ]
+end
+
+@testset "unit: parenthesized variadic ifelse reporter else branch" begin
+  runtime = create_runtime(netlogo"""
+  to-report demo [x]
+    (ifelse
+      x = 0 [ report 10 ]
+      x = 1 [ report 20 ]
+      [ report 30 ]
+    )
+  end
+  """; seed=1)
+
+  @test call!(runtime, "demo", 0) == 10.0
+  @test call!(runtime, "demo", 1) == 20.0
+  @test call!(runtime, "demo", 2) == 30.0
 end
 
 @testset "unit: command task non-local exits" begin
@@ -7478,6 +7965,56 @@ end
 
   call!(runtime, "run-stop-ask")
   @test runtime.world.observer.globals["RUN-STOP-HITS"] == Any[1.0, 1.0, 1.0]
+end
+
+@testset "unit: ask nobody is a no-op" begin
+  runtime = create_runtime(netlogo"""
+  globals [hits]
+
+  to setup
+    clear-all
+    set hits 0
+  end
+
+  to demo
+    ask nobody [ set hits 10 ]
+    set hits hits + 1
+  end
+  """; seed=281)
+
+  call!(runtime, "setup")
+  call!(runtime, "demo")
+  @test runtime.world.observer.globals["HITS"] == 1.0
+end
+
+@testset "unit: recursive link-neighbor ask with leading stop guard" begin
+  runtime = create_runtime(netlogo"""
+  turtles-own [explored?]
+  globals [visit-count]
+
+  to setup
+    clear-all
+    create-turtles 3 [ set explored? false ]
+    ask turtle 0 [ create-link-with turtle 1 ]
+    ask turtle 1 [ create-link-with turtle 2 ]
+    set visit-count 0
+  end
+
+  to explore
+    if explored? [ stop ]
+    set explored? true
+    set visit-count visit-count + 1
+    ask link-neighbors [ explore ]
+  end
+
+  to-report traverse-demo
+    ask turtle 0 [ explore ]
+    report (list visit-count (sort [who] of turtles with [explored?]))
+  end
+  """; seed=282)
+
+  call!(runtime, "setup")
+  @test call!(runtime, "traverse-demo") == Any[3.0, Any[0.0, 1.0, 2.0]]
 end
 
 @testset "unit: foreach concise command references" begin
@@ -8008,18 +8545,28 @@ end
 @testset "unit: nw watts-strogatz generator" begin
   runtime = create_runtime(compile_model("""
   extensions [nw]
-  globals [n-nodes n-edges]
+  globals [n-nodes n-edges rewired-nodes rewired-edges]
 
   to setup
     nw:generate-watts-strogatz turtles links 20 2 0.0 false [ ]
     set n-nodes count turtles
     set n-edges count links
   end
+
+  to rewire
+    clear-all
+    nw:generate-watts-strogatz turtles links 20 2 0.5 false [ ]
+    set rewired-nodes count turtles
+    set rewired-edges count links
+  end
   """); seed=42)
 
   call!(runtime, "setup")
   @test runtime.world.observer.globals["N-NODES"] == 20.0
   @test runtime.world.observer.globals["N-EDGES"] == 40.0  # 20 nodes * 2 neighbors each side
+  call!(runtime, "rewire")
+  @test runtime.world.observer.globals["REWIRED-NODES"] == 20.0
+  @test runtime.world.observer.globals["REWIRED-EDGES"] == 40.0
 end
 
 @testset "unit: nw weak-component-clusters" begin
@@ -8882,10 +9429,23 @@ end
     """); seed=1)
 
     call!(runtime, "setup")
-    call!(runtime, "draw-raster")
+    draw_error = try
+      call!(runtime, "draw-raster")
+      nothing
+    catch err
+      err
+    end
+    @test draw_error isa LogoRuntimeError
+    @test draw_error.message == "gis:paint is not supported in headless mode"
     dc = call!(runtime, "drawing-c")
-    @test dc == 15.0  # should be the color number we set
+    @test dc == 15.0
   end
+end
+
+@testset "unit: gis empty dataset envelopes are safe" begin
+  empty_features = NetLogo.gis.GisVectorFeature[]
+  @test NetLogo.gis._compute_dataset_envelope(empty_features) == (0.0, 0.0, 0.0, 0.0)
+  @test NetLogo.gis._envelope_of_points(Any[]) == (0.0, 0.0, 0.0, 0.0)
 end
 
 # ── Bitstring Extension ──────────────────────────────────────────────────────

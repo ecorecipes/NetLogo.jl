@@ -553,6 +553,20 @@ function set_gui_widget!(session::GUISession, selector, value)
   end
 end
 
+function gui_simple_button_procedure(runtime::RuntimeState, widget::ButtonWidgetSpec)
+  source = strip(widget.source)
+  isempty(source) && return nothing
+  occursin('\n', source) && return nothing
+  occursin('[', source) && return nothing
+  tokens = split(source)
+  length(tokens) == 1 || return nothing
+  procedure = get(runtime.model.procedures, canonical_name(tokens[1]), nothing)
+  procedure isa ProcedureSpec || return nothing
+  procedure.is_reporter && return nothing
+  isempty(procedure.inputs) || return nothing
+  source
+end
+
 """
     press_gui_button!(session::GUISession, selector)
 
@@ -563,9 +577,16 @@ function press_gui_button!(session::GUISession, selector)
     index = resolve_gui_widget_index(session, selector)
     widget = gui_widget_specs(session)[index]
     widget isa ButtonWidgetSpec || throw(LogoRuntimeError("Widget \"$(selector)\" is not a button."))
-    isempty(strip(widget.source)) && return nothing
-    run_string!(gui_button_context(session.runtime, widget), widget.source)
-    nothing
+    simple_proc = gui_simple_button_procedure(session.runtime, widget)
+    simple_proc !== nothing && return call!(session.runtime, simple_proc)
+    isempty(strip(widget.source)) && return false
+    try
+      run_string!(gui_button_context(session.runtime, widget), widget.source)
+      false
+    catch signal
+      signal isa StopSignal || rethrow()
+      true
+    end
   end
 end
 
@@ -634,8 +655,10 @@ function gui_http_handler(session::GUISession)
         return gui_json_response(200, gui_state(session))
       elseif method == "POST" && length(segments) == 4 && segments[1] == "api" && segments[2] == "buttons" && segments[4] == "press"
         button_id = parse(Int, segments[3])
-        press_gui_button!(session, button_id)
-        return gui_json_response(200, gui_state(session))
+        stopped = press_gui_button!(session, button_id)
+        payload = gui_state(session)
+        payload["buttonStopped"] = stopped
+        return gui_json_response(200, payload)
       end
 
       HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"], "Not found")
@@ -1081,6 +1104,10 @@ function gui_application_html()
       async function runForever(widgetId) {
         try {
           await pressButton(widgetId);
+          if (state && state.buttonStopped) {
+            stopForever(widgetId);
+            renderControls();
+          }
         } catch (error) {
           transientError = error.message;
           stopForever(widgetId);

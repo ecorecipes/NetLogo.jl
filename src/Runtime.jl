@@ -123,6 +123,7 @@ mutable struct Context
   in_ask::Bool
   string_scope_depth::Int
   every_state::Dict{Tuple{Int, Any}, UInt64}
+  code_source::String
 end
 
 Context(
@@ -132,7 +133,28 @@ Context(
   caller::Union{Nothing, AbstractAgent},
   in_ask::Bool,
   string_scope_depth::Int) =
-  Context(runtime, agent, locals, caller, in_ask, string_scope_depth, Dict{Tuple{Int, Any}, UInt64}())
+  Context(runtime, agent, locals, caller, in_ask, string_scope_depth, Dict{Tuple{Int, Any}, UInt64}(), runtime.model.source)
+
+Context(
+  runtime::RuntimeState,
+  agent::AbstractAgent,
+  locals::Vector{Dict{String, Any}},
+  caller::Union{Nothing, AbstractAgent},
+  in_ask::Bool,
+  string_scope_depth::Int,
+  every_state::Dict{Tuple{Int, Any}, UInt64}) =
+  Context(runtime, agent, locals, caller, in_ask, string_scope_depth, every_state, runtime.model.source)
+
+Context(
+  runtime::RuntimeState,
+  agent::AbstractAgent,
+  locals::Vector{Dict{String, Any}},
+  caller::Union{Nothing, AbstractAgent},
+  in_ask::Bool,
+  string_scope_depth::Int,
+  every_state::Dict{Tuple{Int, Any}, UInt64},
+  code_source::AbstractString) =
+  Context(runtime, agent, locals, caller, in_ask, string_scope_depth, every_state, String(code_source))
 
 # Dict pool for scope frames — avoids repeated allocation/GC of empty Dicts
 const _SCOPE_DICT_POOL = Dict{String, Any}[]
@@ -862,11 +884,19 @@ const COLOR_LIGHT_SHADE_SPAN = 4.9999
 const COLOR_DARK_BRIGHTNESS_SCALE = 0.05
 const COLOR_SAMPLE_CACHE = Ref{Union{Nothing, Vector{Tuple{Float64, NTuple{3, Float64}}}}}(nothing)
 
-source_fragment(source::String, span::SourceSpan) =
-  span.stop >= span.start ? source[span.start:span.stop] : ""
+function source_fragment(source::String, span::SourceSpan)
+  span.stop >= span.start || return ""
+  chars = collect(source)
+  isempty(chars) && return ""
+  1 <= span.start <= length(chars) || return ""
+  stop = min(span.stop, length(chars))
+  stop >= span.start || return ""
+  join(chars[span.start:stop])
+end
 
 function visible_string_scopes(context::Context)
   depth = min(context.string_scope_depth, length(context.locals))
+  depth == 0 && return Dict{String, Any}[]
   deepcopy(context.locals[1:depth])
 end
 
@@ -959,7 +989,7 @@ function normalize_code_fragment(fragment::AbstractString)
 end
 
 render_code_fragment(context::Context, node::AbstractNode) =
-  normalize_code_fragment(source_fragment(context.runtime.model.source, spanof(node)))
+  normalize_code_fragment(source_fragment(context.code_source, spanof(node)))
 
 render_code_value(context::Context, value::NumberLiteral) = error_logo_string(value.value)
 render_code_value(context::Context, value::StringLiteral) = readable_logo_string(value.value)
@@ -1475,7 +1505,15 @@ end
 function run_plot_callback_code!(context::Context, source::AbstractString)
   has_plot_callback_code(source) || return false
   block = parse_plot_callback_block(context.runtime, source)
-  child = Context(context.runtime, context.runtime.world.observer, [Dict{String, Any}()], nothing, false, 0)
+  child = Context(
+    context.runtime,
+    context.runtime.world.observer,
+    [Dict{String, Any}()],
+    nothing,
+    false,
+    0,
+    Dict{Tuple{Int, Any}, UInt64}(),
+    source)
   with_plot_randomness!(child) do
     try
       execute_block!(child, block, false)
@@ -2010,6 +2048,200 @@ function export_output!(runtime::RuntimeState, path::AbstractString)
   nothing
 end
 
+const WORLD_EXPORT_TEXT_MAGIC = Vector{UInt8}(codeunits("\"export-world data ("))
+
+function world_export_csv_fields(line::AbstractString)
+  isempty(strip(String(line))) && return String[]
+  rows = CSVLib.File(IOBuffer(String(line)); header=false, types=String, silencewarnings=true)
+  isempty(rows) && return String[]
+  row = first(rows)
+  names = CSVLib.getnames(rows)
+  String[ismissing(row[i]) ? "" : something(row[i], "") for i in 1:length(names)]
+end
+
+function is_text_world_export_file(path::AbstractString)
+  prefix = open(path, "r") do io
+    read(io, min(Int(length(WORLD_EXPORT_TEXT_MAGIC)), Int(filesize(path))))
+  end
+  length(prefix) >= length(WORLD_EXPORT_TEXT_MAGIC) || return false
+  @inbounds for i in eachindex(WORLD_EXPORT_TEXT_MAGIC)
+    prefix[i] == WORLD_EXPORT_TEXT_MAGIC[i] || return false
+  end
+  true
+end
+
+function world_export_text_sections(text::AbstractString)
+  normalized = replace(replace(String(text), "\r\n" => "\n"), "\r" => "\n")
+  sections = Dict{String, Vector{Vector{String}}}()
+  for chunk in split(normalized, "\n\n"; keepempty=false)
+    lines = filter(line -> !isempty(strip(line)), split(chunk, '\n'; keepempty=false))
+    isempty(lines) && continue
+    rows = [world_export_csv_fields(line) for line in lines]
+    isempty(rows) && continue
+    length(rows[1]) == 1 || continue
+    sections[uppercase(strip(rows[1][1]))] = rows[2:end]
+  end
+  sections
+end
+
+function parse_text_world_field(field::AbstractString)
+  stripped = strip(String(field))
+  isempty(stripped) && return nothing
+  breed_match = match(r"^\{breed (.+)\}$", stripped)
+  breed_match !== nothing && return canonical_name(strip(only(breed_match.captures)))
+  try
+    return read_literal_from_string(stripped)
+  catch err
+    err isa LiteralParseError || rethrow()
+    return String(stripped)
+  end
+end
+
+function world_export_table_rows(rows::Vector{Vector{String}})
+  isempty(rows) && return String[], Dict{String, Any}[]
+  headers = canonical_name.(rows[1])
+  parsed_rows = Dict{String, Any}[]
+  for row in rows[2:end]
+    parsed = Dict{String, Any}()
+    for (index, header) in enumerate(headers)
+      field = index <= length(row) ? row[index] : ""
+      parsed[header] = parse_text_world_field(field)
+    end
+    push!(parsed_rows, parsed)
+  end
+  headers, parsed_rows
+end
+
+function import_text_world_patches!(world::World, rows::Vector{Vector{String}})
+  headers, patch_rows = world_export_table_rows(rows)
+  for patch_values in patch_rows
+    haskey(patch_values, "PXCOR") && haskey(patch_values, "PYCOR") || continue
+    px = netlogo_exact_int(patch_values["PXCOR"])
+    py = netlogo_exact_int(patch_values["PYCOR"])
+    patch = get_patch(world, px, py)
+    for header in headers
+      header in ("PXCOR", "PYCOR") && continue
+      value = get(patch_values, header, nothing)
+      value === nothing && continue
+      (header in ("PCOLOR", "PLABEL", "PLABEL-COLOR") || haskey(patch.own, header)) || continue
+      set_agent_variable!(world, patch, header, value)
+    end
+  end
+  nothing
+end
+
+function import_text_world_turtles!(world::World, rows::Vector{Vector{String}})
+  headers, turtle_rows = world_export_table_rows(rows)
+  sort!(turtle_rows; by=row -> Int(get(row, "WHO", typemax(Int))))
+  max_id = -1
+  for turtle_values in turtle_rows
+    breed_value = get(turtle_values, "BREED", nothing)
+    breed = breed_value isa AbstractString ? String(breed_value) : "TURTLES"
+    x = haskey(turtle_values, "XCOR") && turtle_values["XCOR"] !== nothing ? numeric(turtle_values["XCOR"]) : 0.0
+    y = haskey(turtle_values, "YCOR") && turtle_values["YCOR"] !== nothing ? numeric(turtle_values["YCOR"]) : 0.0
+    heading = haskey(turtle_values, "HEADING") && turtle_values["HEADING"] !== nothing ? numeric(turtle_values["HEADING"]) : 0.0
+    turtle = create_turtle!(world; breed=breed, x=Float64(x), y=Float64(y), heading=heading)
+    if haskey(turtle_values, "WHO") && turtle_values["WHO"] !== nothing
+      turtle.id = netlogo_exact_int(turtle_values["WHO"])
+      max_id = max(max_id, turtle.id)
+    else
+      max_id = max(max_id, turtle.id)
+    end
+    for header in headers
+      header in ("WHO", "XCOR", "YCOR", "HEADING", "BREED") && continue
+      value = get(turtle_values, header, nothing)
+      value === nothing && continue
+      if header in ("COLOR", "SHAPE", "LABEL", "LABEL-COLOR", "HIDDEN?", "SIZE", "PEN-SIZE", "PEN-MODE")
+        set_agent_variable!(world, turtle, header, value)
+      elseif haskey(turtle.own, header)
+        turtle.own[header] = copy_logo_slot_value(value)
+      end
+    end
+  end
+  sort!(world.turtles; by=turtle -> turtle.id)
+  world.next_turtle_id = max_id + 1
+  reset_patch_memberships!(world)
+  for turtle in world.turtles
+    turtle.alive && register_turtle_on_patch!(world, turtle)
+  end
+  rebuild_turtle_breed_members!(world)
+  nothing
+end
+
+function import_text_world_links!(world::World, rows::Vector{Vector{String}})
+  headers, link_rows = world_export_table_rows(rows)
+  max_id = -1
+  for link_values in link_rows
+    haskey(link_values, "END1") && haskey(link_values, "END2") || continue
+    end1 = turtle_by_id(world, netlogo_exact_int(link_values["END1"]))
+    end2 = turtle_by_id(world, netlogo_exact_int(link_values["END2"]))
+    breed_value = get(link_values, "BREED", nothing)
+    breed = breed_value isa AbstractString ? String(breed_value) : "LINKS"
+    directed_value = get(link_values, "DIRECTED?", nothing)
+    directed = directed_value === nothing ? nothing : logical(directed_value)
+    link = create_link!(world, end1, end2; breed=breed, directed=directed)
+    link === nothing && continue
+    if haskey(link_values, "WHO") && link_values["WHO"] !== nothing
+      link.id = netlogo_exact_int(link_values["WHO"])
+      max_id = max(max_id, link.id)
+    else
+      max_id = max(max_id, link.id)
+    end
+    for header in headers
+      header in ("WHO", "END1", "END2", "BREED", "DIRECTED?") && continue
+      value = get(link_values, header, nothing)
+      value === nothing && continue
+      if header in ("COLOR", "LABEL", "LABEL-COLOR", "HIDDEN?", "THICKNESS", "SHAPE", "TIE-MODE")
+        set_agent_variable!(world, link, header, value)
+      elseif haskey(link.own, header)
+        link.own[header] = copy_logo_slot_value(value)
+      end
+    end
+  end
+  sort!(world.links; by=link -> link.id)
+  max_id >= 0 && (world.next_link_id = max_id + 1)
+  nothing
+end
+
+function import_text_world!(runtime::RuntimeState, path::AbstractString)
+  sections = open(path, "r") do io
+    world_export_text_sections(read(io, String))
+  end
+  global_rows = get(sections, "GLOBALS", nothing)
+  global_rows === nothing && throw(LogoRuntimeError("The file $(path) is not a supported text world export"))
+  headers, parsed_globals_rows = world_export_table_rows(global_rows)
+  isempty(parsed_globals_rows) && throw(LogoRuntimeError("The file $(path) is missing global state"))
+  globals_row = parsed_globals_rows[1]
+  min_pxcor = get(globals_row, "MIN-PXCOR", runtime.world.min_pxcor)
+  max_pxcor = get(globals_row, "MAX-PXCOR", runtime.world.max_pxcor)
+  min_pycor = get(globals_row, "MIN-PYCOR", runtime.world.min_pycor)
+  max_pycor = get(globals_row, "MAX-PYCOR", runtime.world.max_pycor)
+
+  world = World(
+    runtime.model;
+    min_pxcor=netlogo_exact_int(min_pxcor),
+    max_pxcor=netlogo_exact_int(max_pxcor),
+    min_pycor=netlogo_exact_int(min_pycor),
+    max_pycor=netlogo_exact_int(max_pycor),
+    topology=runtime.world.topology,
+    patch_size=runtime.world.patch_size)
+  world.rng = copy(runtime.world.rng)
+
+  for name in runtime.model.globals
+    value = get(globals_row, name, nothing)
+    value === nothing && continue
+    world.observer.globals[name] = copy_logo_slot_value(value)
+  end
+
+  import_text_world_patches!(world, get(sections, "PATCHES", Vector{Vector{String}}()))
+  import_text_world_turtles!(world, get(sections, "TURTLES", Vector{Vector{String}}()))
+  import_text_world_links!(world, get(sections, "LINKS", Vector{Vector{String}}()))
+
+  runtime.world = world
+  runtime.perspective_subject = NOBODY
+  nothing
+end
+
 function export_world!(runtime::RuntimeState, path::AbstractString)
   resolved = resolve_file_path(path, runtime)
   snapshot = WorldPersistenceSnapshot(
@@ -2096,6 +2328,10 @@ end
 function import_world!(runtime::RuntimeState, path::AbstractString)
   resolved = resolve_file_path(path, runtime)
   isfile(resolved) || throw(LogoRuntimeError("The file $(resolved) cannot be found"))
+  if is_text_world_export_file(resolved)
+    import_text_world!(runtime, resolved)
+    return nothing
+  end
   snapshot = open(resolved, "r") do io
     Serialization.deserialize(io)
   end
@@ -3085,9 +3321,9 @@ move_turtle_to_with_pen!(world::World, turtle::Turtle, x::Float64, y::Float64) =
 
 function jump_turtle_with_pen!(world::World, turtle::Turtle, distance::Real)
   ensure_live_agent(world, turtle)
-  heading_radians = deg2rad(turtle.heading)
-  new_x = turtle.xcor + Float64(distance) * sin(heading_radians)
-  new_y = turtle.ycor + Float64(distance) * cos(heading_radians)
+  dx, dy = heading_unit_components(turtle.heading)
+  new_x = turtle.xcor + Float64(distance) * dx
+  new_y = turtle.ycor + Float64(distance) * dy
   move_turtle_to_with_pen!(world, turtle, new_x, new_y)
 end
 
@@ -3582,6 +3818,8 @@ function resolve_variable(context::Context, name::String)
     return breed_agentset(context.runtime.world, name)
   elseif has_link_breed(context.runtime.model, name)
     return link_breed_agentset(context.runtime.world, name)
+  elseif haskey(COLOR_CONSTANT_VALUES, name)
+    return COLOR_CONSTANT_VALUES[name]
   end
   get_agent_variable(context.agent, context.runtime.world, name)
 end
@@ -3593,8 +3831,207 @@ function resolve_nonlocal_variable(context::Context, name::String)
     return breed_agentset(context.runtime.world, name)
   elseif has_link_breed(context.runtime.model, name)
     return link_breed_agentset(context.runtime.world, name)
+  elseif haskey(COLOR_CONSTANT_VALUES, name)
+    return COLOR_CONSTANT_VALUES[name]
   end
   get_agent_variable(context.agent, context.runtime.world, name)
+end
+
+@inline function resolve_nonlocal_variable_for_agent(world::World, model::ModelSpec, agent::AbstractAgent, name::String)
+  if haskey(world.observer.globals, name)
+    return world.observer.globals[name]
+  elseif has_turtle_breed(model, name)
+    return breed_agentset(world, name)
+  elseif has_link_breed(model, name)
+    return link_breed_agentset(world, name)
+  elseif haskey(COLOR_CONSTANT_VALUES, name)
+    return COLOR_CONSTANT_VALUES[name]
+  end
+  get_agent_variable(agent, world, name)
+end
+
+@inline function simple_nonlocal_variable(block::ReporterBlockNode)
+  isempty(block.params) || return nothing
+  expr = block.expr
+  expr isa VariableRef || return nothing
+  expr.search_locals && return nothing
+  expr.name
+end
+
+@inline function simple_boolean_nonlocal_variable(block::ReporterBlockNode)
+  isempty(block.params) || return nothing
+  expr = block.expr
+  if expr isa VariableRef
+    expr.search_locals && return nothing
+    return expr.name, false
+  elseif expr isa ReporterCall && expr.name == "NOT" && length(expr.args) == 1
+    arg = expr.args[1]
+    arg isa VariableRef || return nothing
+    arg.search_locals && return nothing
+    return arg.name, true
+  end
+  nothing
+end
+
+@inline function nonlocal_boolean_matches_agent(world::World, model::ModelSpec, agent::AbstractAgent, descriptor::Tuple{String, Bool})
+  name, negate = descriptor
+  value = logical(resolve_nonlocal_variable_for_agent(world, model, agent, name))
+  negate ? !value : value
+end
+
+procedure_failed_to_report_error(procedure::ProcedureSpec) =
+  LogoRuntimeError("the $(procedure.name) procedure failed to report a result")
+
+@inline function simple_reporter_call_expr(call::ReporterCall, procedure::ProcedureSpec)
+  isempty(call.args) || return nothing
+  isempty(procedure.inputs) || return nothing
+  procedure_needs_frame(procedure) && return nothing
+  simple_report_expr(procedure)
+end
+
+function invoke_zero_input_procedure!(context::Context, procedure::ProcedureSpec)
+  isempty(procedure.inputs) || throw(LogoRuntimeError("procedure $(procedure.name) expected $(length(procedure.inputs)) arguments"))
+  saved_locals = context.locals
+  saved_scope_depth = context.string_scope_depth
+  saved_every_state = context.every_state
+  child_every_state = maybe_acquire_every_state!(context, procedure.body.uses_every)
+  use_scope = procedure.body.creates_scope
+  reusable_frame = procedure.reusable_frame
+  frame = nothing
+  if use_scope
+    frame = reusable_frame ? _get_scope_dict() : Dict{String, Any}()
+    context.locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK, frame)
+    context.string_scope_depth = 1
+  else
+    context.locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK)
+    context.string_scope_depth = 0
+  end
+
+  direct_stmt = procedure.is_reporter ? nothing : single_noscope_stmt(procedure.body)
+  direct_stmts = direct_stmt === nothing ? noscope_statements(procedure.body) : nothing
+  tail_expr = procedure.is_reporter ? tail_report_expr(procedure.body) : nothing
+  stop_guard = procedure.is_reporter ? nothing : leading_stop_guard_expr(procedure.body)
+
+  try
+    if procedure.is_reporter
+      direct_expr = simple_report_expr(procedure)
+      if direct_expr !== nothing
+        return eval_expr(context, direct_expr)
+      elseif tail_expr !== nothing
+        execute_prefix_statements!(context, procedure.body)
+        agent_is_live(context.agent) || throw(procedure_failed_to_report_error(procedure))
+        return eval_expr(context, tail_expr)
+      end
+      execute_block_fast!(context, procedure.body, nothing, direct_stmts, false)
+    else
+      if stop_guard !== nothing
+        logical(eval_expr(context, stop_guard)) && return nothing
+        execute_statements_from!(context, procedure.body.statements, 2)
+      else
+        execute_block_fast!(context, procedure.body, direct_stmt, direct_stmts, false)
+      end
+      return nothing
+    end
+  catch signal
+    if signal isa ReportSignal
+      procedure.is_reporter || throw(report_outside_reporter_error())
+      return signal.value
+    elseif signal isa StopSignal
+      procedure.is_reporter && throw(stop_inside_reporter_error())
+      return nothing
+    end
+    rethrow()
+  finally
+    context.locals = saved_locals
+    context.string_scope_depth = saved_scope_depth
+    restore_every_state!(context, saved_every_state, child_every_state)
+    release_scope_stack_buffer!(context.runtime)
+    use_scope && reusable_frame && _return_scope_dict!(frame::Dict{String, Any})
+  end
+
+  throw(procedure_failed_to_report_error(procedure))
+end
+
+@inline function zero_input_reporter_procedure(model::ModelSpec, block::ReporterBlockNode)
+  expr = block.expr
+  expr isa ReporterCall || return nothing
+  isempty(expr.args) || return nothing
+  cached = expr.cached_prim
+  if cached isa ProcedureSpec
+    procedure = cached
+    return procedure.is_reporter && isempty(procedure.inputs) ? procedure : nothing
+  elseif cached === nothing
+    procedure = get(model.procedures, expr.name, nothing)
+    procedure !== nothing && procedure.is_reporter && isempty(procedure.inputs) || return nothing
+    expr.cached_prim = procedure
+    return procedure
+  end
+  nothing
+end
+
+@inline function simple_reporter_block_expr(model::ModelSpec, block::ReporterBlockNode)
+  expr = block.expr
+  expr isa ReporterCall || return nothing
+  cached = expr.cached_prim
+  if cached isa ProcedureSpec
+    return simple_reporter_call_expr(expr, cached)
+  elseif cached === nothing
+    procedure = get(model.procedures, expr.name, nothing)
+    procedure !== nothing && procedure.is_reporter || return nothing
+    expr.cached_prim = procedure
+    return simple_reporter_call_expr(expr, procedure)
+  end
+  nothing
+end
+
+contains_report_usage(::Any) = false
+contains_report_usage(node::UnaryExpr) = contains_report_usage(node.arg)
+contains_report_usage(node::ListLiteral) = any(contains_report_usage, node.items)
+contains_report_usage(node::ReporterCall) = any(contains_report_usage, node.args)
+contains_report_usage(node::CommandCall) =
+  node.name == "REPORT" || any(contains_report_usage, node.args)
+contains_report_usage(node::BlockNode) = any(contains_report_usage, node.statements)
+contains_report_usage(node::CodeBlockNode) = contains_report_usage(node.body)
+contains_report_usage(::ReporterBlockNode) = false
+contains_report_usage(::CommandTaskNode) = false
+
+@inline function tail_report_expr(block::BlockNode)
+  statements = block.statements
+  isempty(statements) && return nothing
+  stmt = statements[end]
+  stmt isa CommandCall || return nothing
+  stmt.name == "REPORT" || return nothing
+  length(stmt.args) == 1 || return nothing
+  @inbounds for i in 1:(length(statements) - 1)
+    prefix = statements[i]
+    (contains_stop_usage(prefix) || contains_report_usage(prefix)) && return nothing
+  end
+  stmt.args[1]
+end
+
+@inline function execute_prefix_statements!(context::Context, block::BlockNode)
+  statements = block.statements
+  @inbounds for i in 1:(length(statements) - 1)
+    execute_stmt!(context, statements[i]::CommandCall)
+  end
+  nothing
+end
+
+@inline function leading_stop_guard_expr(block::BlockNode)
+  statements = block.statements
+  isempty(statements) && return nothing
+  stmt = statements[1]
+  stmt isa CommandCall || return nothing
+  stmt.name == "IF" || return nothing
+  length(stmt.args) == 2 || return nothing
+  stop_block = stmt.args[2]
+  stop_block isa BlockNode || return nothing
+  length(stop_block.statements) == 1 || return nothing
+  stop_stmt = stop_block.statements[1]
+  stop_stmt isa CommandCall || return nothing
+  stop_stmt.name == "STOP" || return nothing
+  isempty(stop_stmt.args) || return nothing
+  stmt.args[1]
 end
 
 function assign_variable!(context::Context, name::String, value)
@@ -3639,9 +4076,9 @@ function eval_expr(context::Context, expr::UnaryExpr)
 end
 
 eval_expr(context::Context, expr::ReporterBlockNode) =
-  ReporterTaskValue(expr, copy_scope_stack(context.locals), context.runtime.model.source, expr.span, context.string_scope_depth)
+  ReporterTaskValue(expr, copy_scope_stack(context.locals), context.code_source, expr.span, context.string_scope_depth)
 eval_expr(context::Context, expr::CommandTaskNode) =
-  CommandTaskValue(expr, copy_scope_stack(context.locals), context.runtime.model.source, expr.span, context.string_scope_depth)
+  CommandTaskValue(expr, copy_scope_stack(context.locals), context.code_source, expr.span, context.string_scope_depth)
 eval_expr(context::Context, expr::CallableRefNode) = resolve_callable(context, expr.name)
 
 function select_task_actuals(actuals::Vector{Any}, minimum_inputs::Int, maximum_inputs::Union{Nothing, Int}, kind::AbstractString)
@@ -3725,6 +4162,7 @@ function invoke_reporter_task(
   caller::Union{Nothing, AbstractAgent}=context.agent)
   procedure = task.procedure
   direct_expr = simple_report_expr(procedure)
+  tail_expr = tail_report_expr(procedure.body)
   direct_stmts = direct_expr === nothing ? noscope_statements(procedure.body) : nothing
   selected = select_task_actuals(actuals, length(procedure.inputs), length(procedure.inputs), "reporter task")
   frame = task_scope(procedure.inputs, selected)
@@ -3742,10 +4180,13 @@ function invoke_reporter_task(
   context.in_ask = saved_in_ask
   context.string_scope_depth = 1
   try
-    if direct_expr === nothing
-      execute_block_fast!(context, procedure.body, nothing, direct_stmts, false)
-    else
+    if direct_expr !== nothing
       return eval_expr(context, direct_expr)
+    elseif tail_expr !== nothing
+      execute_prefix_statements!(context, procedure.body)
+      return eval_expr(context, tail_expr)
+    else
+      execute_block_fast!(context, procedure.body, nothing, direct_stmts, false)
     end
   catch signal
     if signal isa ReportSignal
@@ -3886,7 +4327,7 @@ end
 
 function eval_reporter_task_arg(context::Context, arg, opname::AbstractString=""; allow_string::Bool=false)
   if arg isa ReporterBlockNode
-    return ReporterTaskValue(arg, copy_scope_stack(context.locals), context.runtime.model.source, arg.span, context.string_scope_depth)
+    return ReporterTaskValue(arg, copy_scope_stack(context.locals), context.code_source, arg.span, context.string_scope_depth)
   elseif arg isa CallableRefNode
     value = resolve_callable(context, arg.name)
     if allow_string && value isa Union{PrimitiveReporterTaskValue, ProcedureReporterTaskValue} && exact_zero_input_reporter(value)
@@ -3899,7 +4340,7 @@ end
 
 function eval_command_task_arg(context::Context, arg, opname::AbstractString=""; allow_string::Bool=false)
   if arg isa CommandTaskNode
-    return CommandTaskValue(arg, copy_scope_stack(context.locals), context.runtime.model.source, arg.span, context.string_scope_depth)
+    return CommandTaskValue(arg, copy_scope_stack(context.locals), context.code_source, arg.span, context.string_scope_depth)
   elseif arg isa CallableRefNode
     value = resolve_callable(context, arg.name)
     if allow_string && value isa Union{PrimitiveReporterTaskValue, ProcedureReporterTaskValue} && exact_zero_input_reporter(value)
@@ -3919,16 +4360,18 @@ function eval_reporter_block(
   caller::Union{Nothing, AbstractAgent},
   actuals::Vector{Any}=EMPTY_ACTUALS)
   if isempty(block.params) && isempty(actuals)
+    direct_expr = simple_reporter_block_expr(context.runtime.model, block)
+    expr = direct_expr === nothing ? block.expr : direct_expr
     # Fast path: no params, no actuals — just switch agent context without copying locals
     if agent === context.agent && caller === context.caller
-      return eval_expr(context, block.expr)
+      return eval_expr(context, expr)
     end
     saved_agent = context.agent
     saved_caller = context.caller
     context.agent = agent
     context.caller = caller
     try
-      return eval_expr(context, block.expr)
+      return eval_expr(context, expr)
     finally
       context.agent = saved_agent
       context.caller = saved_caller
@@ -4194,16 +4637,30 @@ function eval_comparison_reporter(context::Context, call::ReporterCall)
 end
 
 function call_reporter!(context::Context, call::ReporterCall)
-  # Fast path: already-resolved primitive (skips all string comparisons)
+  # Fast path: already-resolved primitive/procedure (skips repeated lookup)
   cached = call.cached_prim
   if cached !== nothing
-    spec = cached::PrimitiveSpec
-    prepared = acquire_prepared_args!(context.runtime, length(call.args))
-    try
-      prepare_args!(prepared, context, spec, call.args)
-      return spec.evaluator(context, prepared)
-    finally
-      release_prepared_args!(context.runtime)
+    if cached isa PrimitiveSpec
+      spec = cached::PrimitiveSpec
+      prepared = acquire_prepared_args!(context.runtime, length(call.args))
+      try
+        prepare_args!(prepared, context, spec, call.args)
+        return spec.evaluator(context, prepared)
+      finally
+        release_prepared_args!(context.runtime)
+      end
+    else
+      procedure = cached::ProcedureSpec
+      direct_expr = simple_reporter_call_expr(call, procedure)
+      direct_expr !== nothing && return eval_expr(context, direct_expr)
+      isempty(call.args) && isempty(procedure.inputs) && return invoke_zero_input_procedure!(context, procedure)
+      prepared = acquire_prepared_args!(context.runtime, length(call.args))
+      try
+        prepare_eval_args!(prepared, context, call.args)
+        return invoke_procedure!(context, procedure, prepared)
+      finally
+        release_prepared_args!(context.runtime)
+      end
     end
   end
 
@@ -4251,6 +4708,10 @@ function call_reporter!(context::Context, call::ReporterCall)
 
   procedure = get(context.runtime.model.procedures, call.name, nothing)
   procedure !== nothing && procedure.is_reporter || throw(LogoRuntimeError("unknown reporter $(call.name)"))
+  call.cached_prim = procedure
+  direct_expr = simple_reporter_call_expr(call, procedure)
+  direct_expr !== nothing && return eval_expr(context, direct_expr)
+  isempty(call.args) && isempty(procedure.inputs) && return invoke_zero_input_procedure!(context, procedure)
   prepared = acquire_prepared_args!(context.runtime, length(call.args))
   try
     prepare_eval_args!(prepared, context, call.args)
@@ -4278,16 +4739,28 @@ end
 end
 
 function execute_stmt!(context::Context, stmt::CommandCall)
-  # Fast path: already-resolved primitive command (skips all string comparisons)
+  # Fast path: already-resolved primitive/procedure command (skips repeated lookup)
   cached = stmt.cached_prim
   if cached !== nothing
-    spec = cached::PrimitiveSpec
-    prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
-    try
-      prepare_args!(prepared, context, spec, stmt.args)
-      spec.evaluator(context, prepared)
-    finally
-      release_prepared_args!(context.runtime)
+    if cached isa PrimitiveSpec
+      spec = cached::PrimitiveSpec
+      prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
+      try
+        prepare_args!(prepared, context, spec, stmt.args)
+        spec.evaluator(context, prepared)
+      finally
+        release_prepared_args!(context.runtime)
+      end
+    else
+      procedure = cached::ProcedureSpec
+      isempty(stmt.args) && isempty(procedure.inputs) && return invoke_zero_input_procedure!(context, procedure)
+      prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
+      try
+        prepare_eval_args!(prepared, context, stmt.args)
+        invoke_procedure!(context, procedure, prepared)
+      finally
+        release_prepared_args!(context.runtime)
+      end
     end
     return nothing
   end
@@ -4333,12 +4806,13 @@ function execute_stmt!(context::Context, stmt::CommandCall)
       # Variadic ifelse: (ifelse cond1 [block1] cond2 [block2] ... [else-block])
       # May or may not have a trailing else block (odd number of args = has else)
       i = 1
-      while i + 1 <= nargs
+      while i <= nargs
         if isodd(nargs) && i == nargs
           # Trailing else block (no condition)
           execute_block!(context, command_block_arg(stmt.args[i]))
           break
         end
+        i + 1 <= nargs || break
         if logical(eval_expr(context, stmt.args[i]))
           execute_block!(context, command_block_arg(stmt.args[i + 1]))
           break
@@ -4357,6 +4831,7 @@ function execute_stmt!(context::Context, stmt::CommandCall)
     return nothing
   elseif stmt.name == "ASK"
     target = eval_expr(context, stmt.args[1])
+    target === NOBODY && return nothing
     block = command_block_arg(stmt.args[2])
     if target isa AbstractAgent
       run_block_for_agents!(context, target, block, true)
@@ -4393,6 +4868,8 @@ function execute_stmt!(context::Context, stmt::CommandCall)
 
   procedure = get(context.runtime.model.procedures, stmt.name, nothing)
   procedure !== nothing && !procedure.is_reporter || throw(LogoRuntimeError("unknown command $(stmt.name)"))
+  stmt.cached_prim = procedure
+  isempty(stmt.args) && isempty(procedure.inputs) && return invoke_zero_input_procedure!(context, procedure)
   prepared = acquire_prepared_args!(context.runtime, length(stmt.args))
   try
     prepare_eval_args!(prepared, context, stmt.args)
@@ -4447,6 +4924,19 @@ execute_block!(context::Context, block::BlockNode) = execute_block!(context, blo
     for index in 2:count
       agent_is_live(context.agent) || return nothing
       execute_stmt!(context, statements[index])
+    end
+  end
+  nothing
+end
+
+@inline function execute_statements_from!(context::Context, statements::Vector{AbstractStmt}, start_index::Int)
+  start_index > length(statements) && return nothing
+  agent_is_live(context.agent) || return nothing
+  @inbounds begin
+    execute_stmt!(context, statements[start_index]::CommandCall)
+    for index in (start_index + 1):length(statements)
+      agent_is_live(context.agent) || return nothing
+      execute_stmt!(context, statements[index]::CommandCall)
     end
   end
   nothing
@@ -4535,6 +5025,7 @@ function invoke_procedure!(context::Context, procedure::ProcedureSpec, args::Vec
   reusable_frame = procedure.reusable_frame
   direct_stmt = procedure.is_reporter ? nothing : single_noscope_stmt(procedure.body)
   direct_stmts = direct_stmt === nothing ? noscope_statements(procedure.body) : nothing
+  stop_guard = procedure.is_reporter ? nothing : leading_stop_guard_expr(procedure.body)
   if needs_frame
     frame = task_scope(procedure.inputs, args, reusable_frame)
     context.locals = acquire_scope_stack_buffer!(context.runtime, EMPTY_SCOPE_STACK, frame)
@@ -4547,9 +5038,34 @@ function invoke_procedure!(context::Context, procedure::ProcedureSpec, args::Vec
 
   if procedure.is_reporter
     direct_expr = simple_report_expr(procedure)
+    tail_expr = tail_report_expr(procedure.body)
     if direct_expr !== nothing
       try
         value = eval_expr(context, direct_expr)
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        return value
+      catch signal
+        if needs_frame
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+        else
+          restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+        end
+        if signal isa StopSignal
+          throw(stop_inside_reporter_error())
+        elseif signal isa ReportSignal
+          return signal.value
+        end
+        rethrow()
+      end
+    elseif tail_expr !== nothing
+      try
+        execute_prefix_statements!(context, procedure.body)
+        agent_is_live(context.agent) || throw(procedure_failed_to_report_error(procedure))
+        value = eval_expr(context, tail_expr)
         if needs_frame
           restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
         else
@@ -4601,10 +5117,22 @@ function invoke_procedure!(context::Context, procedure::ProcedureSpec, args::Vec
     else
       restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
     end
-    throw(LogoRuntimeError("the $(procedure.name) procedure failed to report a result"))
+    throw(procedure_failed_to_report_error(procedure))
   else
     try
-      execute_block_fast!(context, procedure.body, direct_stmt, direct_stmts, false)
+      if stop_guard !== nothing
+        if logical(eval_expr(context, stop_guard))
+          if needs_frame
+            restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state, frame::Dict{String, Any}, reusable_frame)
+          else
+            restore_procedure_context!(context, saved_locals, saved_scope_depth, saved_every_state, child_every_state)
+          end
+          return :stop
+        end
+        execute_statements_from!(context, procedure.body.statements, 2)
+      else
+        execute_block_fast!(context, procedure.body, direct_stmt, direct_stmts, false)
+      end
     catch signal
       if signal isa StopSignal
         if needs_frame
@@ -5499,6 +6027,35 @@ function wait_seconds(value)
 end
 
 headless_user_cancel() = throw(LogoRuntimeError("model halted by user"))
+headless_unsupported(name::AbstractString) =
+  throw(LogoRuntimeError("$(lowercase(String(name))) is not supported in headless mode"))
+
+function headless_user_message!(runtime::RuntimeState, value)
+  write_command_output!(runtime, output_object_text(value; add_newline=true))
+  nothing
+end
+
+headless_hubnet_reset!(runtime::RuntimeState) = nothing
+headless_hubnet_reset_perspective!(runtime::RuntimeState, client_id::AbstractString) = nothing
+headless_hubnet_send!(runtime::RuntimeState, client_id, tag::AbstractString, value) = nothing
+headless_hubnet_broadcast!(runtime::RuntimeState, tag::AbstractString, value) = nothing
+headless_hubnet_broadcast_clear_output!(runtime::RuntimeState) = nothing
+headless_hubnet_broadcast_message!(runtime::RuntimeState, value) = nothing
+headless_hubnet_fetch_message!(runtime::RuntimeState) = nothing
+headless_hubnet_message_waiting(runtime::RuntimeState) = false
+headless_hubnet_message(runtime::RuntimeState) = false
+headless_hubnet_message_source(runtime::RuntimeState) = ""
+headless_hubnet_message_tag(runtime::RuntimeState) = ""
+headless_hubnet_enter_message(runtime::RuntimeState) = false
+headless_hubnet_exit_message(runtime::RuntimeState) = false
+headless_hubnet_clients(runtime::RuntimeState) = Any[]
+headless_hubnet_kick_client!(runtime::RuntimeState, client_id::AbstractString) = nothing
+headless_hubnet_kick_all_clients!(runtime::RuntimeState) = nothing
+headless_hubnet_set_client_interface!(runtime::RuntimeState, client_id::AbstractString, items) = nothing
+headless_hubnet_send_clear_output!(runtime::RuntimeState, client_id) = nothing
+headless_hubnet_send_follow!(runtime::RuntimeState, client_id, target, radius) = nothing
+headless_hubnet_send_watch!(runtime::RuntimeState, client_id, target) = nothing
+headless_hubnet_send_message!(runtime::RuntimeState, client_id, value) = nothing
 
 random_patch_coord(rng::AbstractRNG, mincor::Int, maxcor::Int) = Float64(rand(rng, mincor:maxcor))
 
@@ -5971,8 +6528,10 @@ function agents_in_radius(
   spatial_query_agentset(agentset, opname)
   source_x, source_y = agent_position(source)
 
-  # Fast path: for turtle agentsets, use patch-grid spatial index
-  if agentset.kind == TurtleKind
+  # Fast path: for dynamic turtle agentsets, use patch-grid spatial index.
+  # Exact subsets produced by WITH and related reporters must preserve their
+  # explicit membership, so they use the generic path below.
+  if agentset.kind == TurtleKind && agentset.dynamic
     return _agents_in_radius_spatial(world, source_x, source_y, agentset, radius, wrap)
   end
 
@@ -6551,14 +7110,22 @@ function with_local_randomness!(context::Context, block::BlockNode)
   nothing
 end
 
-function string_run_context(context::Context)
+function string_run_context(context::Context, code_source::AbstractString=context.code_source)
   locals = visible_string_scopes(context)
-  Context(context.runtime, context.agent, locals, context.caller, context.in_ask, length(locals))
+  Context(
+    context.runtime,
+    context.agent,
+    locals,
+    context.caller,
+    context.in_ask,
+    length(locals),
+    Dict{Tuple{Int, Any}, UInt64}(),
+    code_source)
 end
 
 function run_string!(context::Context, source::AbstractString)
   source_text = String(source)
-  child = string_run_context(context)
+  child = string_run_context(context, source_text)
   scope = visible_string_scope_names(child)
   block =
     try
@@ -6572,7 +7139,7 @@ end
 
 function runresult_string(context::Context, source::AbstractString)
   source_text = String(source)
-  child = string_run_context(context)
+  child = string_run_context(context, source_text)
   scope = visible_string_scope_names(child)
   expr =
     try
@@ -6769,11 +7336,15 @@ function face_turtle!(world::World, turtle::Turtle, target; wrap::Bool=true)
   ensure_live_agent(world, turtle)
   target_agent = require_spatial_target(world, target, "FACE")
   target_x, target_y = agent_position(target_agent)
-  heading =
-    wrap ?
-    heading_towards(world, turtle.xcor, turtle.ycor, target_x, target_y) :
-    heading_towards_nowrap(world, turtle.xcor, turtle.ycor, target_x, target_y)
-  set_turtle_heading!(world, turtle, heading)
+  try
+    heading =
+      wrap ?
+      heading_towards(world, turtle.xcor, turtle.ycor, target_x, target_y) :
+      heading_towards_nowrap(world, turtle.xcor, turtle.ycor, target_x, target_y)
+    set_turtle_heading!(world, turtle, heading)
+  catch err
+    err isa LogoRuntimeError && err.message == "no heading is defined from a point to itself" || rethrow()
+  end
   turtle
 end
 
@@ -6783,12 +7354,16 @@ normalize_heading_component(value::Real) =
   isapprox(Float64(value), -1.0; atol=1e-12) ? -1.0 :
   Float64(value)
 
-heading_dx(heading::Real) = normalize_heading_component(sin(deg2rad(Float64(heading))))
-heading_dy(heading::Real) = normalize_heading_component(cos(deg2rad(Float64(heading))))
+heading_dx(heading::Real) = heading_unit_components(heading)[1]
+heading_dy(heading::Real) = heading_unit_components(heading)[2]
 
 function face_turtle_xy!(world::World, turtle::Turtle, x_value, y_value; wrap::Bool=true)
   ensure_live_agent(world, turtle)
-  set_turtle_heading!(world, turtle, towardsxy_from(world, turtle, x_value, y_value; wrap=wrap))
+  try
+    set_turtle_heading!(world, turtle, towardsxy_from(world, turtle, x_value, y_value; wrap=wrap))
+  catch err
+    err isa LogoRuntimeError && err.message == "no heading is defined from a point to itself" || rethrow()
+  end
   turtle
 end
 
@@ -6853,16 +7428,10 @@ end
 function can_move(world::World, turtle::Turtle, distance_value)
   ensure_live_agent(world, turtle)
   distance = numeric(distance_value)
-  heading_radians = deg2rad(turtle.heading)
-  new_x = turtle.xcor + distance * sin(heading_radians)
-  new_y = turtle.ycor + distance * cos(heading_radians)
-  try
-    apply_topology(world, new_x, new_y)
-    true
-  catch err
-    err isa LogoRuntimeError || rethrow()
-    false
-  end
+  dx, dy = heading_unit_components(turtle.heading)
+  new_x = turtle.xcor + distance * dx
+  new_y = turtle.ycor + distance * dy
+  maybe_apply_topology(world, new_x, new_y) !== nothing
 end
 
 ordered_turtle_heading(index::Int, count::Int) = count <= 0 ? 0.0 : 360.0 * Float64(index) / Float64(count)
@@ -7311,8 +7880,31 @@ end
 function filter_agentset(context::Context, agentset::AgentSet, block::ReporterBlockNode)
   members = sizehint!(AbstractAgent[], agentset_capacity(agentset))
   caller = block_caller(context)
-  @for_agents agent agentset begin
-    logical(eval_reporter_block(context, block, agent, caller)) && push!(members, agent)
+  simple_bool = simple_boolean_nonlocal_variable(block)
+  procedure = zero_input_reporter_procedure(context.runtime.model, block)
+  if simple_bool !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    @for_agents agent agentset begin
+      nonlocal_boolean_matches_agent(world, model, agent, simple_bool::Tuple{String, Bool}) && push!(members, agent)
+    end
+  elseif procedure === nothing
+    @for_agents agent agentset begin
+      logical(eval_reporter_block(context, block, agent, caller)) && push!(members, agent)
+    end
+  else
+    saved_agent = context.agent
+    saved_caller = context.caller
+    context.caller = caller
+    try
+      @for_agents agent agentset begin
+        context.agent = agent
+        logical(invoke_zero_input_procedure!(context, procedure)) && push!(members, agent)
+      end
+    finally
+      context.agent = saved_agent
+      context.caller = saved_caller
+    end
   end
   owned_agentset(agentset.kind, members; breed=agentset.breed)
 end
@@ -7335,8 +7927,31 @@ function count_with_fastpath(context::Context, call::ReporterCall)
   block = with_args[2]::ReporterBlockNode
   caller = block_caller(context)
   matched = 0
-  @for_agents agent base begin
-    logical(eval_reporter_block(context, block, agent, caller)) && (matched += 1)
+  simple_bool = simple_boolean_nonlocal_variable(block)
+  procedure = zero_input_reporter_procedure(context.runtime.model, block)
+  if simple_bool !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    @for_agents agent base begin
+      nonlocal_boolean_matches_agent(world, model, agent, simple_bool::Tuple{String, Bool}) && (matched += 1)
+    end
+  elseif procedure === nothing
+    @for_agents agent base begin
+      logical(eval_reporter_block(context, block, agent, caller)) && (matched += 1)
+    end
+  else
+    saved_agent = context.agent
+    saved_caller = context.caller
+    context.caller = caller
+    try
+      @for_agents agent base begin
+        context.agent = agent
+        logical(invoke_zero_input_procedure!(context, procedure)) && (matched += 1)
+      end
+    finally
+      context.agent = saved_agent
+      context.caller = saved_caller
+    end
   end
   Float64(matched)
 end
@@ -7392,15 +8007,60 @@ end
   endswith(name, "-HERE") ? name[1:end-5] : name
 end
 
+function any_link_neighbors_with_simple_bool_fastpath(context::Context, base_expr, block::ReporterBlockNode)
+  base_expr isa ReporterCall || return nothing
+  base_expr.name == "LINK-NEIGHBORS" || return nothing
+  isempty(base_expr.args) || return nothing
+  turtle = context.agent
+  turtle isa Turtle || return nothing
+  descriptor = simple_boolean_nonlocal_variable(block)
+  descriptor === nothing && return nothing
+  world = context.runtime.world
+  model = context.runtime.model
+  for link in get(world.turtle_links, turtle.id, Link[])
+    link.alive || continue
+    neighbor_id = link.end1 == turtle.id ? link.end2 : link.end1
+    neighbor = maybe_turtle_by_id(world, neighbor_id)
+    neighbor === nothing && continue
+    nonlocal_boolean_matches_agent(world, model, neighbor, descriptor::Tuple{String, Bool}) && return true
+  end
+  false
+end
+
 function any_with_fastpath(context::Context, call::ReporterCall)
   with_args = with_call_components(call)
   with_args === nothing && return nothing
+  direct_link_neighbor_match = any_link_neighbors_with_simple_bool_fastpath(context, with_args[1], with_args[2]::ReporterBlockNode)
+  direct_link_neighbor_match !== nothing && return direct_link_neighbor_match
   base = eval_expr(context, with_args[1])
   base isa AgentSet || return nothing
   block = with_args[2]::ReporterBlockNode
   caller = block_caller(context)
-  @for_agents agent base begin
-    logical(eval_reporter_block(context, block, agent, caller)) && return true
+  simple_bool = simple_boolean_nonlocal_variable(block)
+  procedure = zero_input_reporter_procedure(context.runtime.model, block)
+  if simple_bool !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    @for_agents agent base begin
+      nonlocal_boolean_matches_agent(world, model, agent, simple_bool::Tuple{String, Bool}) && return true
+    end
+  elseif procedure === nothing
+    @for_agents agent base begin
+      logical(eval_reporter_block(context, block, agent, caller)) && return true
+    end
+  else
+    saved_agent = context.agent
+    saved_caller = context.caller
+    context.caller = caller
+    try
+      @for_agents agent base begin
+        context.agent = agent
+        logical(invoke_zero_input_procedure!(context, procedure)) && return true
+      end
+    finally
+      context.agent = saved_agent
+      context.caller = saved_caller
+    end
   end
   false
 end
@@ -7421,6 +8081,17 @@ function sum_of_fastpath(context::Context, call::ReporterCall)
   target = eval_expr(context, of_args[2])
   target isa AgentSet || return nothing
   block = of_args[1]::ReporterBlockNode
+  simple_name = simple_nonlocal_variable(block)
+  if simple_name !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    total = 0.0
+    @for_agents agent target begin
+      value = resolve_nonlocal_variable_for_agent(world, model, agent, simple_name)
+      is_logo_number(value) && (total += Float64(value))
+    end
+    return total
+  end
   caller = block_caller(context)
   total = 0.0
   @for_agents agent target begin
@@ -7436,6 +8107,26 @@ function mean_of_fastpath(context::Context, call::ReporterCall)
   target = eval_expr(context, of_args[2])
   target isa AgentSet || return nothing
   block = of_args[1]::ReporterBlockNode
+  simple_name = simple_nonlocal_variable(block)
+  if simple_name !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    total = 0.0
+    matched = 0
+    sampled = nothing
+    @for_agents agent target begin
+      value = resolve_nonlocal_variable_for_agent(world, model, agent, simple_name)
+      if is_logo_number(value)
+        total += Float64(value)
+        matched += 1
+      elseif matched == 0
+        sampled === nothing && (sampled = Any[])
+        push!(sampled::Vector{Any}, value)
+      end
+    end
+    matched > 0 || throw(aggregate_numeric_error("mean", sampled === nothing ? Any[] : sampled))
+    return total / matched
+  end
   caller = block_caller(context)
   total = 0.0
   matched = 0
@@ -7494,10 +8185,37 @@ function one_of_with_fastpath(context::Context, call::ReporterCall)
   rng = context.runtime.world.rng
   chosen = NOBODY
   matched = 0
-  @for_agents agent base begin
-    logical(eval_reporter_block(context, block, agent, caller)) || continue
-    matched += 1
-    rand(rng, 1:matched) == 1 && (chosen = agent)
+  simple_bool = simple_boolean_nonlocal_variable(block)
+  procedure = zero_input_reporter_procedure(context.runtime.model, block)
+  if simple_bool !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    @for_agents agent base begin
+      nonlocal_boolean_matches_agent(world, model, agent, simple_bool::Tuple{String, Bool}) || continue
+      matched += 1
+      rand(rng, 1:matched) == 1 && (chosen = agent)
+    end
+  elseif procedure === nothing
+    @for_agents agent base begin
+      logical(eval_reporter_block(context, block, agent, caller)) || continue
+      matched += 1
+      rand(rng, 1:matched) == 1 && (chosen = agent)
+    end
+  else
+    saved_agent = context.agent
+    saved_caller = context.caller
+    context.caller = caller
+    try
+      @for_agents agent base begin
+        context.agent = agent
+        logical(invoke_zero_input_procedure!(context, procedure)) || continue
+        matched += 1
+        rand(rng, 1:matched) == 1 && (chosen = agent)
+      end
+    finally
+      context.agent = saved_agent
+      context.caller = saved_caller
+    end
   end
   chosen
 end
@@ -7513,6 +8231,27 @@ function all_agentset(context::Context, agentset::AgentSet, block::ReporterBlock
 end
 
 function of_value(context::Context, block::ReporterBlockNode, target)
+  simple_name = simple_nonlocal_variable(block)
+  if simple_name !== nothing
+    world = context.runtime.world
+    model = context.runtime.model
+    if target isa AgentSet
+      _members, _all_live = agentset_members_for_iteration(target)
+      result = Vector{Any}(undef, length(_members))
+      _j = 0
+      @inbounds for _i in eachindex(_members)
+        agent = _members[_i]
+        if _all_live || agent_is_live(agent)
+          _j += 1
+          result[_j] = resolve_nonlocal_variable_for_agent(world, model, agent, simple_name)
+        end
+      end
+      resize!(result, _j)
+      return result
+    elseif target isa AbstractAgent
+      return resolve_nonlocal_variable_for_agent(world, model, target, simple_name)
+    end
+  end
   caller = block_caller(context)
   if target isa AgentSet
     _members, _all_live = agentset_members_for_iteration(target)
@@ -7897,7 +8636,7 @@ function build_default_registry()
   register_primitive!(registry, "USER-DIRECTORY", REPORTER, reporter_syntax(ret=WildcardType),
     (ctx, args) -> false)
   register_primitive!(registry, "USER-MESSAGE", COMMAND, command_syntax(right=[WildcardType]),
-    (ctx, args) -> nothing)  # headless: silently ignore
+    (ctx, args) -> headless_user_message!(ctx.runtime, args[1]))
 
   # BUT-LAST alias (BL/BUTLAST already registered)
   register_primitive!(registry, "BUT-LAST", REPORTER, reporter_syntax(right=[ListType | StringType], ret=ListType | StringType),
@@ -7905,63 +8644,63 @@ function build_default_registry()
 
   # Movie primitives (headless stubs)
   register_primitive!(registry, "MOVIE-START", COMMAND, command_syntax(right=[StringType]),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-start"))
   register_primitive!(registry, "MOVIE-GRAB-VIEW", COMMAND, command_syntax(),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-grab-view"))
   register_primitive!(registry, "MOVIE-GRAB-INTERFACE", COMMAND, command_syntax(),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-grab-interface"))
   register_primitive!(registry, "MOVIE-CLOSE", COMMAND, command_syntax(),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-close"))
   register_primitive!(registry, "MOVIE-CANCEL", COMMAND, command_syntax(),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-cancel"))
   register_primitive!(registry, "MOVIE-SET-FRAME-RATE", COMMAND, command_syntax(right=[NumberType]),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_unsupported("movie-set-frame-rate"))
   register_primitive!(registry, "MOVIE-STATUS", REPORTER, reporter_syntax(ret=StringType),
-    (ctx, args) -> "No movie.")
+    (ctx, args) -> headless_unsupported("movie-status"))
 
   # HubNet primitives (headless stubs)
   register_primitive!(registry, "HUBNET-RESET", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_reset!(ctx.runtime))
   register_primitive!(registry, "HUBNET-RESET-PERSPECTIVE", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_reset_perspective!(ctx.runtime, String(args[1])))
   register_primitive!(registry, "HUBNET-SEND", COMMAND, command_syntax(right=[WildcardType, StringType, WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_send!(ctx.runtime, args[1], String(args[2]), args[3]))
   register_primitive!(registry, "HUBNET-BROADCAST", COMMAND, command_syntax(right=[StringType, WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_broadcast!(ctx.runtime, String(args[1]), args[2]))
   register_primitive!(registry, "HUBNET-BROADCAST-CLEAR-OUTPUT", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_broadcast_clear_output!(ctx.runtime))
   register_primitive!(registry, "HUBNET-BROADCAST-MESSAGE", COMMAND, command_syntax(right=[WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_broadcast_message!(ctx.runtime, args[1]))
   register_primitive!(registry, "HUBNET-FETCH-MESSAGE", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_fetch_message!(ctx.runtime))
   register_primitive!(registry, "HUBNET-MESSAGE-WAITING?", REPORTER, reporter_syntax(ret=BooleanType, agent_classes="O---"),
-    (ctx, args) -> false)
+    (ctx, args) -> headless_hubnet_message_waiting(ctx.runtime))
   register_primitive!(registry, "HUBNET-MESSAGE", REPORTER, reporter_syntax(ret=WildcardType, agent_classes="O---"),
-    (ctx, args) -> "")
+    (ctx, args) -> headless_hubnet_message(ctx.runtime))
   register_primitive!(registry, "HUBNET-MESSAGE-SOURCE", REPORTER, reporter_syntax(ret=StringType, agent_classes="O---"),
-    (ctx, args) -> "")
+    (ctx, args) -> headless_hubnet_message_source(ctx.runtime))
   register_primitive!(registry, "HUBNET-MESSAGE-TAG", REPORTER, reporter_syntax(ret=StringType, agent_classes="O---"),
-    (ctx, args) -> "")
+    (ctx, args) -> headless_hubnet_message_tag(ctx.runtime))
   register_primitive!(registry, "HUBNET-ENTER-MESSAGE?", REPORTER, reporter_syntax(ret=BooleanType, agent_classes="O---"),
-    (ctx, args) -> false)
+    (ctx, args) -> headless_hubnet_enter_message(ctx.runtime))
   register_primitive!(registry, "HUBNET-EXIT-MESSAGE?", REPORTER, reporter_syntax(ret=BooleanType, agent_classes="O---"),
-    (ctx, args) -> false)
+    (ctx, args) -> headless_hubnet_exit_message(ctx.runtime))
   register_primitive!(registry, "HUBNET-CLIENTS-LIST", REPORTER, reporter_syntax(ret=ListType, agent_classes="O---"),
-    (ctx, args) -> Any[])
+    (ctx, args) -> headless_hubnet_clients(ctx.runtime))
   register_primitive!(registry, "HUBNET-KICK-CLIENT", COMMAND, command_syntax(right=[StringType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_kick_client!(ctx.runtime, String(args[1])))
   register_primitive!(registry, "HUBNET-KICK-ALL-CLIENTS", COMMAND, command_syntax(agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_kick_all_clients!(ctx.runtime))
   register_primitive!(registry, "HUBNET-SET-CLIENT-INTERFACE", COMMAND, command_syntax(right=[StringType, ListType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_set_client_interface!(ctx.runtime, String(args[1]), args[2]))
   register_primitive!(registry, "HUBNET-SEND-CLEAR-OUTPUT", COMMAND, command_syntax(right=[WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_send_clear_output!(ctx.runtime, args[1]))
   register_primitive!(registry, "HUBNET-SEND-FOLLOW", COMMAND, command_syntax(right=[WildcardType, WildcardType, NumberType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_send_follow!(ctx.runtime, args[1], args[2], args[3]))
   register_primitive!(registry, "HUBNET-SEND-WATCH", COMMAND, command_syntax(right=[WildcardType, WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_send_watch!(ctx.runtime, args[1], args[2]))
   register_primitive!(registry, "HUBNET-SEND-MESSAGE", COMMAND, command_syntax(right=[WildcardType, WildcardType], agent_classes="O---"),
-    (ctx, args) -> nothing)
+    (ctx, args) -> headless_hubnet_send_message!(ctx.runtime, args[1], args[2]))
   register_primitive!(registry, "SET-CURRENT-PLOT", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
     (ctx, args) -> set_current_plot!(ctx.runtime, String(args[1])))
   register_primitive!(registry, "CREATE-TEMPORARY-PLOT-PEN", COMMAND, command_syntax(right=[StringType], agent_classes="OTPL"),
@@ -8208,6 +8947,7 @@ function build_default_registry()
     command_syntax(right=[AgentType | AgentsetType, CommandBlockType], arg_modes=[:eval, :block], introduces_context=true),
     function (ctx, args)
       target = args[1]
+      target === NOBODY && return nothing
       if target isa AbstractAgent
         run_block_for_agents!(ctx, target, args[2], true)
       else

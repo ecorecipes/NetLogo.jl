@@ -318,7 +318,7 @@ function register_extension!(registry::PrimitiveRegistry)
     command_syntax(right=[WildcardType, NumberType, NumberType]),
     (ctx, args) -> begin
       ensure_bitmap(args[1], "bitmap:copy-to-drawing")
-      nothing  # headless stub
+      throw(LogoRuntimeError("bitmap:copy-to-drawing is not supported in headless mode"))
     end)
 
   register_primitive!(registry, "BITMAP:COPY-TO-PCOLORS", COMMAND,

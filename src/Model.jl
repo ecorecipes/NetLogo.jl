@@ -70,7 +70,7 @@ mutable struct ReporterCall <: AbstractExpr
   name::String
   args::Vector{Any}
   span::SourceSpan
-  cached_prim::Any   # lazily resolved PrimitiveSpec (avoids Dict lookup after first call)
+  cached_prim::Any   # lazily resolved primitive/procedure (avoids Dict lookup after first call)
 end
 
 ReporterCall(name::String, args::Vector{Any}, span::SourceSpan) =
@@ -80,7 +80,7 @@ mutable struct CommandCall <: AbstractStmt
   name::String
   args::Vector{Any}
   span::SourceSpan
-  cached_prim::Any   # lazily resolved PrimitiveSpec (avoids Dict lookup after first call)
+  cached_prim::Any   # lazily resolved primitive/procedure (avoids Dict lookup after first call)
 end
 
 CommandCall(name::String, args::Vector{Any}, span::SourceSpan) =
@@ -645,6 +645,8 @@ mutable struct World
   links::Vector{Link}
   observer::Observer
   dynamic_agentsets::Dict{Tuple{AgentKind, String}, AgentSet}
+  turtle_links::Dict{Int, Vector{Link}}
+  link_neighbor_cache::Dict{Tuple{Int, String, Symbol}, AgentSet}
   turtle_breed_members::Dict{String, Vector{Turtle}}
   turtle_breed_shapes::Dict{String, String}
   link_breed_shapes::Dict{String, String}
@@ -718,6 +720,8 @@ function World(
     Link[],
     observer,
     Dict{Tuple{AgentKind, String}, AgentSet}(),
+    Dict{Int, Vector{Link}}(),
+    Dict{Tuple{Int, String, Symbol}, AgentSet}(),
     Dict{String, Vector{Turtle}}(),
     Dict{String, String}("TURTLES" => "default"),
     Dict{String, String}("LINKS" => "default"),
@@ -737,6 +741,14 @@ function clear_turtle_breed_members!(world::World)
   empty!(world.turtle_breed_members)
   nothing
 end
+
+function clear_turtle_links!(world::World)
+  empty!(world.turtle_links)
+  empty!(world.link_neighbor_cache)
+  nothing
+end
+
+invalidate_link_neighbor_cache!(world::World) = (empty!(world.link_neighbor_cache); nothing)
 
 function remove_turtle_breed_member!(members::Vector{Turtle}, turtle::Turtle)
   index = findfirst(candidate -> candidate === turtle, members)
@@ -823,6 +835,10 @@ function wrap_axis(pos::Float64, mincor::Int, maxcor::Int)
   value == high ? low : value
 end
 
+@inline function wrap_axis(pos::Int, mincor::Int, maxcor::Int)
+  mincor + mod(pos - mincor, maxcor - mincor + 1)
+end
+
 function apply_topology(world::World, x::Float64, y::Float64)
   if world.topology == Torus
     return wrap_axis(x, world.min_pxcor, world.max_pxcor), wrap_axis(y, world.min_pycor, world.max_pycor)
@@ -843,6 +859,21 @@ function apply_topology(world::World, x::Float64, y::Float64)
     end
     return x, y
   end
+end
+
+@inline function maybe_apply_topology(world::World, x::Float64, y::Float64)
+  if world.topology == Torus
+    return wrap_axis(x, world.min_pxcor, world.max_pxcor), wrap_axis(y, world.min_pycor, world.max_pycor)
+  elseif world.topology == VerticalCylinder
+    (y < world.min_pycor - 0.5 || y >= world.max_pycor + 0.5) && return nothing
+    return wrap_axis(x, world.min_pxcor, world.max_pxcor), y
+  elseif world.topology == HorizontalCylinder
+    (x < world.min_pxcor - 0.5 || x >= world.max_pxcor + 0.5) && return nothing
+    return x, wrap_axis(y, world.min_pycor, world.max_pycor)
+  end
+  (x < world.min_pxcor - 0.5 || x >= world.max_pxcor + 0.5 ||
+   y < world.min_pycor - 0.5 || y >= world.max_pycor + 0.5) && return nothing
+  x, y
 end
 
 is_topology_bounds_error(err::LogoRuntimeError) =
@@ -965,6 +996,7 @@ function clear_turtles!(world::World; reset_ids::Bool=true)
   foreach(link -> (link.alive = false), world.links)
   empty!(world.turtles)
   empty!(world.links)
+  clear_turtle_links!(world)
   clear_turtle_breed_members!(world)
   reset_patch_memberships!(world)
   if reset_ids
@@ -977,6 +1009,7 @@ end
 function clear_links!(world::World; reset_ids::Bool=false)
   foreach(link -> (link.alive = false), world.links)
   empty!(world.links)
+  clear_turtle_links!(world)
   if reset_ids
     world.next_link_id = 0
   end
@@ -1151,12 +1184,13 @@ function set_link_breed!(world::World, link::Link, breed::AbstractString)
   link.breed = canonical
   link.own = new_own
   canonical != old_breed && (link.shape = default_link_shape(world, canonical))
+  canonical != old_breed && invalidate_link_neighbor_cache!(world)
   link
 end
 
 function existing_link(world::World, end1::Turtle, end2::Turtle, breed::String; directed::Union{Nothing, Bool}=nothing)
   canonical = canonical_name(breed)
-  for link in world.links
+  for link in get(world.turtle_links, end1.id, Link[])
     if link.alive && link.breed == canonical
       directed !== nothing && link.directed != directed && continue
       if link.directed
@@ -1195,11 +1229,32 @@ function create_link!(world::World, end1::Turtle, end2::Turtle; breed::String="L
     default_link_own(world, canonical_breed),
     true)
   push!(world.links, link)
+  push!(get!(world.turtle_links, end1.id) do
+    Link[]
+  end, link)
+  push!(get!(world.turtle_links, end2.id) do
+    Link[]
+  end, link)
+  invalidate_link_neighbor_cache!(world)
   link
 end
 
+function remove_link_from_bucket!(bucket::Vector{Link}, link::Link)
+  index = findfirst(candidate -> candidate === link, bucket)
+  index !== nothing && deleteat!(bucket, index)
+  bucket
+end
+
 function kill_link!(world::World, link::Link)
+  link.alive || return link
+  remove_link_from_bucket!(get!(world.turtle_links, link.end1) do
+    Link[]
+  end, link)
+  remove_link_from_bucket!(get!(world.turtle_links, link.end2) do
+    Link[]
+  end, link)
   link.alive = false
+  invalidate_link_neighbor_cache!(world)
   link
 end
 
@@ -1208,9 +1263,12 @@ function kill_turtle!(world::World, turtle::Turtle)
   unregister_turtle_from_patch!(world, turtle)
   unregister_turtle_breed_members!(world, turtle)
   turtle.alive = false
-  for link in world.links
-    link.alive && (link.end1 == turtle.id || link.end2 == turtle.id) && kill_link!(world, link)
+  for link in copy(get!(world.turtle_links, turtle.id) do
+    Link[]
+  end)
+    link.alive && kill_link!(world, link)
   end
+  invalidate_link_neighbor_cache!(world)
   turtle
 end
 
@@ -1339,10 +1397,50 @@ move_turtle_to!(world::World, turtle::Turtle, x::Float64, y::Float64) =
 turn_turtle!(world::World, turtle::Turtle, delta::Real) =
   set_turtle_heading!(world, turtle, turtle.heading + Float64(delta))
 
+const HEADING_SQRT_HALF = sqrt(0.5)
+const INTEGER_HEADING_UNIT_COMPONENTS = ntuple(i -> begin
+  angle = i - 1
+  (sinpi(angle / 180), cospi(angle / 180))
+end, 360)
+
+@inline function integer_patch_coord(value::Real)
+  value isa Integer && return Int(value)
+  float = Float64(value)
+  truncated = trunc(Int, float)
+  float == truncated ? truncated : nothing
+end
+
+@inline function heading_unit_components(heading::Real)
+  normalized = mod(Float64(heading), 360.0)
+  truncated = trunc(Int, normalized)
+  if normalized == truncated
+    return INTEGER_HEADING_UNIT_COMPONENTS[mod(truncated, 360) + 1]
+  end
+  if isapprox(normalized, 0.0; atol=1e-12)
+    return 0.0, 1.0
+  elseif isapprox(normalized, 45.0; atol=1e-12)
+    return HEADING_SQRT_HALF, HEADING_SQRT_HALF
+  elseif isapprox(normalized, 90.0; atol=1e-12)
+    return 1.0, 0.0
+  elseif isapprox(normalized, 135.0; atol=1e-12)
+    return HEADING_SQRT_HALF, -HEADING_SQRT_HALF
+  elseif isapprox(normalized, 180.0; atol=1e-12)
+    return 0.0, -1.0
+  elseif isapprox(normalized, 225.0; atol=1e-12)
+    return -HEADING_SQRT_HALF, -HEADING_SQRT_HALF
+  elseif isapprox(normalized, 270.0; atol=1e-12)
+    return -1.0, 0.0
+  elseif isapprox(normalized, 315.0; atol=1e-12)
+    return -HEADING_SQRT_HALF, HEADING_SQRT_HALF
+  end
+  radians = deg2rad(normalized)
+  sin(radians), cos(radians)
+end
+
 function jump_turtle!(world::World, turtle::Turtle, distance::Real)
-  heading_radians = deg2rad(turtle.heading)
-  new_x = turtle.xcor + Float64(distance) * sin(heading_radians)
-  new_y = turtle.ycor + Float64(distance) * cos(heading_radians)
+  dx, dy = heading_unit_components(turtle.heading)
+  new_x = turtle.xcor + Float64(distance) * dx
+  new_y = turtle.ycor + Float64(distance) * dy
   move_turtle_to!(world, turtle, new_x, new_y)
 end
 
@@ -1399,9 +1497,24 @@ function heading_towards_nowrap(world::World, source_x::Real, source_y::Real, ta
 end
 
 function patch_at_heading_and_distance(world::World, source_x::Real, source_y::Real, heading::Real, distance::Real)
-  heading_radians = deg2rad(Float64(heading))
-  target_x = Float64(source_x) + Float64(distance) * sin(heading_radians)
-  target_y = Float64(source_y) + Float64(distance) * cos(heading_radians)
+  source_px = integer_patch_coord(source_x)
+  source_py = integer_patch_coord(source_y)
+  patch_distance = integer_patch_coord(distance)
+  if source_px !== nothing && source_py !== nothing && patch_distance !== nothing
+    normalized = mod(Float64(heading), 360.0)
+    if isapprox(normalized, 0.0; atol=1e-12)
+      return maybe_patch(world, source_px, source_py + patch_distance)
+    elseif isapprox(normalized, 90.0; atol=1e-12)
+      return maybe_patch(world, source_px + patch_distance, source_py)
+    elseif isapprox(normalized, 180.0; atol=1e-12)
+      return maybe_patch(world, source_px, source_py - patch_distance)
+    elseif isapprox(normalized, 270.0; atol=1e-12)
+      return maybe_patch(world, source_px - patch_distance, source_py)
+    end
+  end
+  dx, dy = heading_unit_components(heading)
+  target_x = Float64(source_x) + Float64(distance) * dx
+  target_y = Float64(source_y) + Float64(distance) * dy
   maybe_patch(world, target_x, target_y)
 end
 
@@ -1428,13 +1541,10 @@ function current_agentset_members(agentset::AgentSet)
     end
   elseif agentset.kind == LinkKind
     breed = agentset.breed
-    members = sizehint!(Link[], length(world.links))
     if breed === nothing || breed == "LINKS"
-      for link in world.links
-        link.alive && push!(members, link)
-      end
-      return members
+      return world.links
     end
+    members = sizehint!(Link[], length(world.links))
     for link in world.links
       link.alive && link.breed == breed && push!(members, link)
     end
@@ -1463,7 +1573,7 @@ end
 
 function all_links(world::World)
   get!(world.dynamic_agentsets, (LinkKind, "LINKS")) do
-    AgentSet(LinkKind, AbstractAgent[]; breed="LINKS", dynamic=true, world=world)
+    AgentSet(LinkKind, AbstractAgent[]; breed="LINKS", dynamic=true, all_live=false, world=world)
   end
 end
 
@@ -1486,15 +1596,25 @@ function link_breed_agentset(world::World, breed::AbstractString)
 end
 
 function maybe_patch(world::World, x::Real, y::Real)
-  try
-    wrapped_x, wrapped_y = apply_topology(world, Float64(x), Float64(y))
-    get_patch(world, round_patch_coord(wrapped_x), round_patch_coord(wrapped_y))
-  catch err
-    if err isa LogoRuntimeError
-      return NOBODY
-    end
-    rethrow()
+  wrapped = maybe_apply_topology(world, Float64(x), Float64(y))
+  wrapped === nothing && return NOBODY
+  wrapped_x, wrapped_y = wrapped
+  get_patch(world, round_patch_coord(wrapped_x), round_patch_coord(wrapped_y))
+end
+
+@inline function maybe_patch(world::World, x::Int, y::Int)
+  if world.topology == Torus
+    return get_patch(world, wrap_axis(x, world.min_pxcor, world.max_pxcor), wrap_axis(y, world.min_pycor, world.max_pycor))
+  elseif world.topology == VerticalCylinder
+    (y < world.min_pycor || y > world.max_pycor) && return NOBODY
+    return get_patch(world, wrap_axis(x, world.min_pxcor, world.max_pxcor), y)
+  elseif world.topology == HorizontalCylinder
+    (x < world.min_pxcor || x > world.max_pxcor) && return NOBODY
+    return get_patch(world, x, wrap_axis(y, world.min_pycor, world.max_pycor))
   end
+  (x < world.min_pxcor || x > world.max_pxcor ||
+   y < world.min_pycor || y > world.max_pycor) && return NOBODY
+  get_patch(world, x, y)
 end
 
 function turtles_on_patch_canonical(world::World, patch::Patch, canonical_breed::AbstractString)
@@ -1602,42 +1722,23 @@ function diffuse_patches!(world::World, variable::AbstractString, amount::Real; 
     old_values[i] = Float64(value)
   end
 
-  deltas = four_way ?
-    ((1, 0), (-1, 0), (0, 1), (0, -1)) :
-    ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
-
+  neighbor_cache = four_way ? world.patch_neighbors4 : world.patch_neighbors8
+  amount_f = Float64(amount)
   new_values = Vector{Float64}(undef, n)
-  # Scratch buffer for neighbor indices to detect duplicates
-  nbuf = Vector{Int}(undef, four_way ? 4 : 8)
   @inbounds for i in 1:n
-    patch = world.patches[i]
-    px, py = patch.pxcor, patch.pycor
     old_value = old_values[i]
-    neighbor_sum = 0.0
-    neighbor_count = 0
-    for (dx, dy) in deltas
-      np = maybe_patch(world, px + dx, py + dy)
-      np === NOBODY && continue
-      np.pxcor == px && np.pycor == py && continue
-      j = patch_index(world, np.pxcor, np.pycor)
-      # Check for duplicates (wrap edges)
-      dup = false
-      for k in 1:neighbor_count
-        if nbuf[k] == j
-          dup = true
-          break
-        end
-      end
-      dup && continue
-      neighbor_count += 1
-      nbuf[neighbor_count] = j
-      neighbor_sum += old_values[j]
-    end
+    neighbors = current_agentset_members(neighbor_cache[i])
+    neighbor_count = length(neighbors)
     if neighbor_count == 0
       new_values[i] = old_value
     else
+      neighbor_sum = 0.0
+      for neighbor_any in neighbors
+        neighbor = neighbor_any::Patch
+        neighbor_sum += old_values[patch_index(world, neighbor.pxcor, neighbor.pycor)]
+      end
       avg = neighbor_sum / neighbor_count
-      new_values[i] = old_value + Float64(amount) * (avg - old_value)
+      new_values[i] = old_value + amount_f * (avg - old_value)
     end
   end
 
@@ -1649,8 +1750,10 @@ end
 
 function my_links(world::World, turtle::Turtle; breed::Union{Nothing, String}=nothing, mode::Symbol=:all)
   canonical_breed = breed === nothing ? nothing : canonical_name(breed)
-  members = sizehint!(AbstractAgent[], length(world.links))
-  for link in living_links(world)
+  links = get(world.turtle_links, turtle.id, Link[])
+  members = sizehint!(AbstractAgent[], length(links))
+  for link in links
+    link.alive || continue
     canonical_breed !== nothing && link.breed != canonical_breed && continue
     touches = link.end1 == turtle.id || link.end2 == turtle.id
     if mode == :all
@@ -1664,21 +1767,41 @@ function my_links(world::World, turtle::Turtle; breed::Union{Nothing, String}=no
   owned_agentset(LinkKind, members; breed=canonical_breed)
 end
 
+@inline function link_neighbor_cache_key(turtle::Turtle, canonical_breed::Union{Nothing, String}, mode::Symbol)
+  (turtle.id, canonical_breed === nothing ? "" : canonical_breed, mode)
+end
+
 function link_neighbors(world::World, turtle::Turtle; breed::Union{Nothing, String}=nothing, mode::Symbol=:all)
-  ids = Set{Int}()
-  for raw_link in my_links(world, turtle; breed=breed, mode=mode)
-    link = raw_link::Link
-    if mode == :in
-      push!(ids, link.directed ? link.end1 : (link.end1 == turtle.id ? link.end2 : link.end1))
-    elseif mode == :out
-      push!(ids, link.directed ? link.end2 : (link.end1 == turtle.id ? link.end2 : link.end1))
-    else
-      push!(ids, link.end1 == turtle.id ? link.end2 : link.end1)
+  canonical_breed = breed === nothing ? nothing : canonical_name(breed)
+  key = link_neighbor_cache_key(turtle, canonical_breed, mode)
+  get!(world.link_neighbor_cache, key) do
+    ids = Set{Int}()
+    for link in get(world.turtle_links, turtle.id, Link[])
+      link.alive || continue
+      canonical_breed !== nothing && link.breed != canonical_breed && continue
+      if mode == :in
+        if link.directed
+          link.end2 == turtle.id || continue
+          push!(ids, link.end1)
+        else
+          push!(ids, link.end1 == turtle.id ? link.end2 : link.end1)
+        end
+      elseif mode == :out
+        if link.directed
+          link.end1 == turtle.id || continue
+          push!(ids, link.end2)
+        else
+          push!(ids, link.end1 == turtle.id ? link.end2 : link.end1)
+        end
+      else
+        (link.end1 == turtle.id || link.end2 == turtle.id) || continue
+        push!(ids, link.end1 == turtle.id ? link.end2 : link.end1)
+      end
     end
+    members = sizehint!(AbstractAgent[], length(ids))
+    for id in sort!(collect(ids))
+      push!(members, turtle_by_id(world, id))
+    end
+    owned_agentset(TurtleKind, members; breed="TURTLES")
   end
-  members = sizehint!(AbstractAgent[], length(ids))
-  for id in sort!(collect(ids))
-    push!(members, turtle_by_id(world, id))
-  end
-  owned_agentset(TurtleKind, members; breed="TURTLES")
 end

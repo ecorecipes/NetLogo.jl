@@ -40,11 +40,13 @@ end
     parse_sd_section(sd_text::AbstractString) -> String
 
 Parse the System Dynamics section text and return generated NetLogo code.
-Returns empty string if the section is empty / unparseable.
+Returns empty string if the section is empty or does not contain SD data.
+Throws when the section looks like SD data but is malformed.
 """
 function parse_sd_section(sd_text::AbstractString)
   text = String(strip(sd_text))
   isempty(text) && return ""
+  occursin("org.nlogo.sdm.gui.AggregateDrawing", text) || return ""
 
   lines = split(text, '\n')
   isempty(lines) && return ""
@@ -52,7 +54,8 @@ function parse_sd_section(sd_text::AbstractString)
   # First non-blank line is the dt value
   dt_str = String(strip(lines[1]))
   dt_val = tryparse(Float64, dt_str)
-  dt_val === nothing && return ""
+  (dt_val === nothing || dt_val <= 0) &&
+    throw(LogoRuntimeError("Could not parse System Dynamics section: invalid dt '$dt_str'"))
 
   # Build line map and parse elements
   stocks = SDStock[]
@@ -74,25 +77,25 @@ function parse_sd_section(sd_text::AbstractString)
       push!(reservoir_figure_lines, i)
     elseif contains(s, "org.nlogo.sdm.gui.WrappedStock")
       name, initial_expr, non_neg = _parse_wrapped_stock(s)
-      if name !== nothing
-        push!(stocks, SDStock(name, initial_expr, non_neg))
-        # Associate with parent StockFigure (previous line usually)
-        if haskey(stock_figure_lines, i - 1)
-          stock_figure_lines[i - 1] = name
-        end
+      name !== nothing ||
+        throw(LogoRuntimeError("Could not parse System Dynamics section: invalid stock definition on line $i"))
+      push!(stocks, SDStock(name, initial_expr, non_neg))
+      # Associate with parent StockFigure (previous line usually)
+      if haskey(stock_figure_lines, i - 1)
+        stock_figure_lines[i - 1] = name
       end
     elseif contains(s, "org.nlogo.sdm.gui.WrappedRate")
       name, expr, extra = _parse_wrapped_rate(s)
-      if name !== nothing
-        push!(rates_raw, (i, expr, name))
-        rate_extra_tokens[i] = extra
-      end
+      name !== nothing ||
+        throw(LogoRuntimeError("Could not parse System Dynamics section: invalid rate definition on line $i"))
+      push!(rates_raw, (i, expr, name))
+      rate_extra_tokens[i] = extra
     elseif contains(s, "org.nlogo.sdm.gui.WrappedConverter")
       name, expr = _parse_wrapped_converter(s)
-      if name !== nothing
-        is_const = _is_constant_expression(expr)
-        push!(converters, SDConverter(name, expr, is_const))
-      end
+      name !== nothing ||
+        throw(LogoRuntimeError("Could not parse System Dynamics section: invalid converter definition on line $i"))
+      is_const = _is_constant_expression(expr)
+      push!(converters, SDConverter(name, expr, is_const))
     end
   end
 
@@ -151,6 +154,7 @@ function _parse_quoted_strings(s::AbstractString)
           j += 1
         end
       end
+      j <= lastindex(s) || return nothing
       push!(results, String(take!(buf)))
       i = j + 1
     else
@@ -162,17 +166,24 @@ end
 
 function _parse_wrapped_stock(s::AbstractString)
   qs = _parse_quoted_strings(s)
+  qs === nothing && return (nothing, "", false)
   length(qs) < 2 && return (nothing, "", false)
   name = qs[1]
   initial_expr = qs[2]
-  # Non-negative flag is last token
-  tokens = split(s)
-  non_neg = !isempty(tokens) && last(tokens) == "1"
+  last_quote_end = findlast('"', s)
+  last_quote_end === nothing && return (nothing, "", false)
+  extra_str = strip(s[nextind(s, last_quote_end):end])
+  tokens = isempty(extra_str) ? String[] : String.(split(extra_str))
+  isempty(tokens) && return (nothing, "", false)
+  flag = tryparse(Int, last(tokens))
+  (flag === nothing || !(flag in (0, 1))) && return (nothing, "", false)
+  non_neg = flag == 1
   (name, initial_expr, non_neg)
 end
 
 function _parse_wrapped_rate(s::AbstractString)
   qs = _parse_quoted_strings(s)
+  qs === nothing && return (nothing, "", String[])
   length(qs) < 2 && return (nothing, "", String[])
   expr = qs[1]
   name = qs[2]
@@ -185,12 +196,27 @@ end
 
 function _parse_wrapped_converter(s::AbstractString)
   qs = _parse_quoted_strings(s)
+  qs === nothing && return (nothing, "")
   length(qs) < 2 && return (nothing, "")
   (qs[2], qs[1])  # name is second, expression is first
 end
 
 function _is_constant_expression(expr::AbstractString)
-  tryparse(Float64, strip(expr)) !== nothing
+  source = strip(String(expr))
+  isempty(source) && return false
+  try
+    read_literal_from_string(source)
+    true
+  catch err
+    err isa LiteralParseError && return false
+    rethrow()
+  end
+end
+
+function _sort_sd_stocks(stocks::Vector{SDStock})
+  sort(
+    copy(stocks);
+    by=s -> (_is_constant_expression(s.initial_value) ? 0 : 1, uppercase(s.name)))
 end
 
 function _resolve_rate_source_sink(
@@ -336,13 +362,14 @@ function _generate_sd_code(
 
   constant_converters = filter(c -> c.is_constant, converters)
   variable_converters = filter(c -> !c.is_constant, converters)
+  sorted_stocks = _sort_sd_stocks(stocks)
 
   # ── globals ──
   global_names = String[]
   for c in sort(constant_converters; by=c -> c.name)
     push!(global_names, c.name)
   end
-  for s in sort(stocks; by=s -> s.name)
+  for s in sorted_stocks
     push!(global_names, s.name)
   end
   push!(global_names, "dt")
@@ -361,7 +388,7 @@ function _generate_sd_code(
   for c in sort(constant_converters; by=c -> c.name)
     println(io, "  set ", c.name, " ", c.expression)
   end
-  for s in sort(stocks; by=s -> s.name)
+  for s in sorted_stocks
     println(io, "  set ", s.name, " ", s.initial_value)
   end
   println(io, "end")
@@ -395,8 +422,7 @@ function _generate_sd_code(
   end
 
   # Update stock values
-  stock_by_name = Dict(s.name => s for s in stocks)
-  for s in sort(stocks; by=s -> s.name)
+  for s in sorted_stocks
     inflows = get(stock_inflows, s.name, String[])
     outflows = get(stock_outflows, s.name, String[])
 
@@ -417,7 +443,7 @@ function _generate_sd_code(
     end
   end
 
-  for s in sort(stocks; by=s -> s.name)
+  for s in sorted_stocks
     println(io, "  set ", s.name, " new-", s.name)
   end
 
@@ -427,7 +453,7 @@ function _generate_sd_code(
 
   # ── system-dynamics-do-plot ──
   println(io, "to system-dynamics-do-plot")
-  for s in sort(stocks; by=s -> s.name)
+  for s in sorted_stocks
     println(io, "  if plot-pen-exists? \"", s.name, "\" [")
     println(io, "    set-current-plot-pen \"", s.name, "\"")
     println(io, "    plotxy ticks ", s.name)

@@ -1491,6 +1491,10 @@ function parse_call_arguments(
     end
     bare_mask = strip_flags(mask)
     mode = effective_arg_mode(mask, syntax.arg_modes[index])
+    prefer_bare_callable =
+      mode == :reporter_task &&
+      index < length(syntax.right) &&
+      strip_flags(syntax.right[index + 1]) != WildcardType
     if is_repeatable(mask)
       # In non-parenthesized form, limit total args to default_count if set
       max_args = (repeatable_across_newlines || syntax.default_count < 0) ? typemax(Int) : syntax.default_count
@@ -1502,7 +1506,15 @@ function parse_call_arguments(
             break
           end
         end
-        push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
+        push!(args, parse_argument(
+          stream,
+          bare_mask,
+          mode,
+          model,
+          registry,
+          scope,
+          expression_min_precedence;
+          prefer_bare_callable=prefer_bare_callable))
         if stop_repeatable_at_newline
           if check(stream, NewlineToken)
             # Peek past newline: continue only for unambiguous expression starters
@@ -1530,7 +1542,15 @@ function parse_call_arguments(
     if is_optional(mask) && !can_start_argument(stream, bare_mask, model, registry)
       continue
     end
-    push!(args, parse_argument(stream, bare_mask, mode, model, registry, scope, expression_min_precedence))
+    push!(args, parse_argument(
+      stream,
+      bare_mask,
+      mode,
+      model,
+      registry,
+      scope,
+      expression_min_precedence;
+      prefer_bare_callable=prefer_bare_callable))
   end
   args
 end
@@ -1596,9 +1616,10 @@ function parse_argument(
   model::ModelSpec,
   registry::PrimitiveRegistry,
   scope::Set{String},
-  expression_min_precedence::Int)
+  expression_min_precedence::Int;
+  prefer_bare_callable::Bool=false)
   if mode == :reporter_task
-    return parse_reporter_task(stream, model, registry, scope)
+    return parse_reporter_task(stream, model, registry, scope; prefer_bare_callable)
   elseif mode == :command_task
     return parse_command_task(stream, model, registry, scope)
   elseif mode == :code_block || compatible(mask, CodeBlockType)
@@ -1742,7 +1763,12 @@ function parse_reporter_block(stream::TokenStream, model::ModelSpec, registry::P
   ReporterBlockNode(params, expr, span_union(start.span, stop.span))
 end
 
-function parse_reporter_task(stream::TokenStream, model::ModelSpec, registry::PrimitiveRegistry, scope::Set{String})
+function parse_reporter_task(
+  stream::TokenStream,
+  model::ModelSpec,
+  registry::PrimitiveRegistry,
+  scope::Set{String};
+  prefer_bare_callable::Bool=false)
   token = peek(stream)
   if token.kind == LBracketToken
     if has_explicit_task_syntax(stream)
@@ -1750,8 +1776,24 @@ function parse_reporter_task(stream::TokenStream, model::ModelSpec, registry::Pr
     end
     return parse_reporter_block(stream, model, registry, scope)
   elseif token.kind == IdentifierToken || token.kind == OperatorToken
+    name = canonical_name(token.lexeme)
+    if identifier_is_variable_like(name, model, scope)
+      return parse_expression(stream, model, registry, scope, 0)
+    end
+    saved = stream.index
     advance!(stream)
-    return CallableRefNode(canonical_name(token.lexeme), token.span)
+    nxt = peek(stream)
+    if prefer_bare_callable || nxt.kind in (EofToken, NewlineToken, RBracketToken, RParenToken, CommaToken)
+      return CallableRefNode(name, token.span)
+    end
+    stream.index = saved
+    try
+      return parse_expression(stream, model, registry, scope, 0)
+    catch err
+      err isa Diagnostic || rethrow()
+      stream.index = saved + 1
+      return CallableRefNode(name, token.span)
+    end
   end
   parse_expression(stream, model, registry, scope, 0)
 end
@@ -1794,6 +1836,25 @@ end
 
 identifier_is_variable_like(name::String, model::ModelSpec, scope::Set{String}) =
   name in scope || name in model.globals || name in BUILTIN_VARIABLE_NAMES || has_turtle_breed(model, name) || has_link_breed(model, name)
+
+function dash_prefixed_variable_name(
+  stream::TokenStream,
+  model::ModelSpec,
+  scope::Set{String};
+  require_adjacent::Bool=false)
+  check(stream, OperatorToken) && peek(stream).lexeme == "-" || return nothing
+  minus = peek(stream)
+  next_idx = stream.index + 1
+  next_idx <= length(stream.tokens) || return nothing
+  ident = stream.tokens[next_idx]
+  ident.kind == IdentifierToken || return nothing
+  if require_adjacent && ident.span.start != minus.span.stop + 1
+    return nothing
+  end
+  combined = canonical_name("-" * ident.lexeme)
+  identifier_is_variable_like(combined, model, scope) || return nothing
+  combined, ident
+end
 
 function command_accepts_zero_inputs(syntax::PrimitiveSyntax)
   min_inputs = syntax.left == VoidType ? 0 : 1
@@ -2040,6 +2101,8 @@ function parse_expression(stream::TokenStream, model::ModelSpec, registry::Primi
       token = peek(stream)
     end
 
+    dash_prefixed_variable_name(stream, model, scope; require_adjacent=true) !== nothing && break
+
     op_name =
       if token.kind == OperatorToken || token.kind == IdentifierToken
         canonical_name(token.lexeme)
@@ -2124,16 +2187,12 @@ function parse_prefix(stream::TokenStream, model::ModelSpec, registry::Primitive
       parse_reporter_block(stream, model, registry, scope) :
       parse_list_literal(stream, model, registry, scope)
   elseif token.kind == OperatorToken && token.lexeme == "-"
-    # Check if -identifier is a variable name in scope (e.g., let -s "")
-    next_idx = stream.index + 1
-    if next_idx <= length(stream.tokens) && stream.tokens[next_idx].kind == IdentifierToken
-      combined = "-" * stream.tokens[next_idx].lexeme
-      cname = canonical_name(combined)
-      if identifier_is_variable_like(cname, model, scope)
-        advance!(stream)  # consume '-'
-        ident = advance!(stream)  # consume identifier
-        return VariableRef(cname, span_union(token.span, ident.span), false)
-      end
+    dash_prefixed = dash_prefixed_variable_name(stream, model, scope)
+    if dash_prefixed !== nothing
+      cname, ident = dash_prefixed
+      advance!(stream)  # consume '-'
+      advance!(stream)  # consume identifier
+      return VariableRef(cname, span_union(token.span, ident.span), true)
     end
     advance!(stream)
     expr = parse_expression(stream, model, registry, scope, PrefixPrecedence)
@@ -2603,7 +2662,7 @@ function parse_nlogox_model(
   end
 
   stream = TokenStream(tokenize(code_source))
-  model = ModelSpec(source)
+  model = ModelSpec(code_source)
   model.has_interface_section = true
   model.source_path = source_path === nothing ? nothing : String(source_path)
   raw_procedures = RawProcedure[]
