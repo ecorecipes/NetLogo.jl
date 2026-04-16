@@ -13,7 +13,7 @@ The package targets Julia 1.12.
 
 ## A minimal embedded model
 
-```julia
+```@setup getting-started
 using NetLogo
 
 model = netlogo"""
@@ -34,6 +34,9 @@ end
 
 runtime = create_runtime(model; seed=42)
 call!(runtime, "setup")
+```
+
+```@example getting-started
 for _ in 1:10
     call!(runtime, "go")
 end
@@ -43,17 +46,45 @@ length(runtime.world.turtles), runtime.world.ticks
 
 Use `netlogo"""..."""` when the model source lives naturally beside Julia code, tests, or benchmarks.
 
-## Loading a `.nlogo` model
+## Loading a model from disk
 
-```julia
+The example below writes a tiny standalone source file so the page stays self-contained. In normal use, `load_model` usually points at an existing `.nlogo` file from disk.
+
+```@setup getting-started-file
 using NetLogo
 
-model = load_model("path/to/model.nlogo")
-runtime = create_runtime(model; seed=1)
-call!(runtime, "setup")
+source = """
+globals [population]
+
+to setup
+  clear-all
+  create-turtles 5 [ setxy who 0 ]
+  set population count turtles
+  reset-ticks
+end
+"""
+
+path = joinpath(mktempdir(), "demo.nls")
+write(path, source)
+
+file_runtime = create_runtime(load_model(path); seed=7)
+call!(file_runtime, "setup")
+```
+
+```@example getting-started-file
+runresult(file_runtime, "population")
 ```
 
 `load_model` sets the source path used for relative `__includes` resolution, so included `.nls` files are handled the same way as embedded model code.
+
+## Runtime string evaluation
+
+`call!` is ideal for named procedures already compiled into the model. When you want to execute ad hoc NetLogo code from Julia, use [`run_commands!`](@ref) and [`runresult`](@ref):
+
+```@example getting-started-file
+run_commands!(file_runtime, "ask turtles [ set color blue ]")
+runresult(file_runtime, "count turtles with [color = blue]")
+```
 
 ## Optional browser and notebook GUI
 

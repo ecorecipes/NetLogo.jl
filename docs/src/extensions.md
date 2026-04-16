@@ -27,6 +27,29 @@ Use them from NetLogo source through the usual declaration:
 extensions [gis table time]
 ```
 
+## A minimal extension-backed model
+
+```@example extensions
+using NetLogo
+
+model = netlogo"""
+extensions [table]
+globals [answer]
+
+to setup
+  clear-all
+  let t table:make
+  table:put t "susceptible" 42
+  set answer table:get t "susceptible"
+  reset-ticks
+end
+"""
+
+runtime = create_runtime(model)
+call!(runtime, "setup")
+runresult(runtime, "answer")
+```
+
 ## Extension loading
 
 When a model declares `extensions [...]`, the runtime resolves extension modules by name and invokes either `register_extension!` or `register_primitives!` on the resolved module.
@@ -36,3 +59,9 @@ The public low-level registration hook is [`register_primitive!`](@ref), which i
 ## External extension modules
 
 External Julia modules can be loaded as extensions if they are visible from the chosen `extension_host` module and define one of the expected registration hooks. This makes it possible to host project-specific extensions beside model code without modifying the `NetLogo.jl` package itself.
+
+In practice, that means you typically:
+
+1. define a Julia module that exports the extension registration hook,
+2. compile or load the model with `extension_host=@__MODULE__`, and
+3. create the runtime with the same `extension_host` so the extension module can be resolved again at runtime.

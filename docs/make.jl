@@ -1,6 +1,8 @@
 using Documenter
 using NetLogo
 
+Documenter.DocMeta.setdocmeta!(NetLogo, :DocTestSetup, :(using NetLogo); recursive=true)
+
 const REPO_URL = "https://github.com/ecorecipes/NetLogo.jl"
 const REPO = Documenter.Remotes.GitHub("ecorecipes", "NetLogo.jl")
 
@@ -14,8 +16,8 @@ makedocs(
         repolink = REPO_URL,
     ),
     remotes = nothing,
-    checkdocs = :none,
-    doctest = false,
+    checkdocs = :exports,
+    doctest = true,
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting-started.md",

@@ -1,5 +1,13 @@
 # API Reference
 
+This page includes every exported public API entry. The docs build enforces that coverage with `checkdocs = :exports`.
+
+## Module
+
+```@docs
+NetLogo
+```
+
 ## Compilation and model loading
 
 ```@docs
@@ -15,6 +23,8 @@ NetLogo.@netlogo_str
 ```@docs
 NetLogo.create_runtime
 NetLogo.call!
+NetLogo.run_commands!
+NetLogo.runresult
 NetLogo.gui_session
 NetLogo.gui_state
 NetLogo.set_gui_widget!
