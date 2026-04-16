@@ -97,9 +97,12 @@ const MODELS = Dict(
     "evolutionofnorms"  => EvolutionOfNormsModel(),
     "lassavirus"        => LassaVirusModel(),
     "axelrodcultural"   => AxelrodCulturalModel(),
+    "ethnocentrism"     => EthnocentrismModel(),
     "mousetraps"        => MousetrapsModel(),
     "firebenchmark"     => FireBenchmarkModel(),
     # Modeling Commons classic models
+    "daisyworld"        => DaisyworldModel(),
+    "dla"               => DLAModel(),
     "dlasimple"         => DLASimpleModel(),
     "boiling"           => BoilingModel(),
     "soliddiffusion"    => SolidDiffusionModel(),

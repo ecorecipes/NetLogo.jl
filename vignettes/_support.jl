@@ -24,7 +24,7 @@ Base.include(@__MODULE__, joinpath(REPO_ROOT, "eval", "NetLogoCompare.jl"))
 function ensure_all_model_files_loaded!()
   for path in sort(readdir(EVAL_MODELS_DIR; join=true))
     endswith(path, ".jl") || continue
-    match_obj = match(r"struct\s+([A-Za-z0-9_]+)\s*<:\s*AbstractBenchmarkModel", read(path, String))
+    match_obj = match(r"struct\s+([A-Za-z0-9_]+)\s*<:\s*[A-Za-z0-9_]*BenchmarkModel", read(path, String))
     match_obj === nothing && continue
     type_name = Symbol(only(match_obj.captures))
     isdefined(NetLogoCompare, type_name) || Base.include(NetLogoCompare, path)
@@ -38,7 +38,7 @@ function discover_model_types()
   mapping = Dict{Symbol, Symbol}()
   for path in sort(readdir(EVAL_MODELS_DIR; join=true))
     endswith(path, ".jl") || continue
-    match_obj = match(r"struct\s+([A-Za-z0-9_]+)\s*<:\s*AbstractBenchmarkModel", read(path, String))
+    match_obj = match(r"struct\s+([A-Za-z0-9_]+)\s*<:\s*[A-Za-z0-9_]*BenchmarkModel", read(path, String))
     match_obj === nothing && continue
     key = Symbol(first(splitext(basename(path))))
     type_name = Symbol(only(match_obj.captures))
@@ -245,7 +245,14 @@ function benchmark_workspace(benchmark_model)
 end
 
 function benchmark_runtime(benchmark_model; seed::Integer=1, workspace_dir::Union{Nothing, AbstractString}=nothing)
-  compiled = NetLogo.compile_model(NetLogoCompare.netlogo_code(benchmark_model))
+  compiled = if benchmark_model isa NetLogoCompare.FileBenchmarkModel
+    NetLogo.compile_model(
+      NetLogoCompare.full_nlogo_source(benchmark_model);
+      source_path=NetLogoCompare.nlogo_path(benchmark_model),
+    )
+  else
+    NetLogo.compile_model(NetLogoCompare.netlogo_code(benchmark_model))
+  end
   synthesize_standard_interface!(compiled, benchmark_model)
   runtime = NetLogo.create_runtime(
     compiled;
@@ -255,6 +262,7 @@ function benchmark_runtime(benchmark_model; seed::Integer=1, workspace_dir::Unio
   )
   pre_setup = strip(NetLogoCompare.pre_setup_commands(benchmark_model))
   isempty(pre_setup) || NetLogo.run_commands!(runtime, pre_setup)
+  NetLogo.run_commands!(runtime, "random-seed $seed")
   runtime
 end
 

@@ -41,15 +41,15 @@ export AbstractBenchmarkModel, ComparisonReport, CalibratedReport,
         # Extension models (table, matrix, rnd, nw, profiler, csv)
         CropRotationModel, RationalEvolvingPDModel, SearchPathModel,
         BullwhipEffectModel, InfiniteLifeModel, ResilientTeamModel,
-        PrivacyOpinionModel, ArtificialEconomyModel, VoronoiVoterModel,
-        CyberspaceOpinionModel, ABTgcModel,
-         # Modeling Commons new candidates
-         EvolutionOfNormsModel, LassaVirusModel, AxelrodCulturalModel,
-         MousetrapsModel, FireBenchmarkModel,
-         # Modeling Commons classic models
-         DLASimpleModel, BoilingModel, SolidDiffusionModel, FlockingModel,
-         SandModel, RopeModel, PolymerDynamicsModel, ThermostatModel,
-         CrystallizationModel, MimicryModel,
+         PrivacyOpinionModel, ArtificialEconomyModel, VoronoiVoterModel,
+         CyberspaceOpinionModel, ABTgcModel,
+          # Modeling Commons new candidates
+          EvolutionOfNormsModel, LassaVirusModel, AxelrodCulturalModel,
+          EthnocentrismModel, MousetrapsModel, FireBenchmarkModel,
+          # Modeling Commons classic models
+          DaisyworldModel, DLAModel, DLASimpleModel, BoilingModel, SolidDiffusionModel, FlockingModel,
+          SandModel, RopeModel, PolymerDynamicsModel, ThermostatModel,
+          CrystallizationModel, MimicryModel,
          # NW extension eval wrappers
          SuperDiffuserModel, DrugUseModel, ProductsModel, SocialInfluenceModel,
          ParticipatoryDisinformationModel, InfoDiffusionModel,
@@ -177,6 +177,28 @@ function full_nlogo_source(model::FileBenchmarkModel)
     read(nlogo_path(model), String)
 end
 
+function ensure_random_seed_inputbox(source::AbstractString)
+    code = nlogo_section(source, 1)
+    widgets = strip(nlogo_section(source, 2))
+    has_random_seed_global = occursin(r"globals\s*\[.*\brandomSeed\b"si, code)
+    has_random_seed_widget = occursin(r"(?m)^randomSeed$", widgets)
+    (has_random_seed_global || has_random_seed_widget) && return String(source)
+
+    inputbox = """INPUTBOX
+10
+460
+170
+520
+randomSeed
+0.0
+1
+0
+Number
+"""
+    replacement = isempty(widgets) ? inputbox : widgets * "\n\n" * inputbox
+    replace_nlogo_section(source, 2, replacement)
+end
+
 function turtle_shapes_text(model::AbstractBenchmarkModel)
     extra_shapes(model)
 end
@@ -188,7 +210,8 @@ end
 function build_behaviorspace_xml(
     model::AbstractBenchmarkModel;
     fixed_seed::Union{Nothing, Int}=nothing,
-    seed_values::Union{Nothing, Vector{Int}}=nothing)
+    seed_values::Union{Nothing, Vector{Int}}=nothing,
+    seed_placeholder::Bool=false)
     metrics = join(["    <metric>$g</metric>" for g in tracked_globals(model)], "\n")
     metric_block = isempty(metrics) ? "" : metrics * "\n"
     pre_cmds = strip(pre_setup_commands(model))
@@ -203,6 +226,11 @@ function build_behaviorspace_xml(
 $values
     </enumeratedValueSet>
 """
+    elseif seed_placeholder && fixed_seed === nothing
+        seed_block = """    <enumeratedValueSet variable="randomSeed">
+      __SEEDS_PLACEHOLDER__
+    </enumeratedValueSet>
+"""
     end
     """<experiments>
   <experiment name="benchmark" repetitions="1" runMetricsEveryStep="true">
@@ -214,16 +242,20 @@ $(metric_block)$(seed_block)  </experiment>
 """
 end
 
+netlogo_code(model::FileBenchmarkModel) = strip(nlogo_section(full_nlogo_source(model), 1))
+
+function nlogo_source(model::FileBenchmarkModel)
+    source = full_nlogo_source(model)
+    source = replace_nlogo_section(source, 5, "NetLogo 6.4.0")
+    source = ensure_random_seed_inputbox(source)
+    replace_nlogo_section(source, 8, build_behaviorspace_xml(model; seed_placeholder=true))
+end
+
 """Build a well-formed .nlogo file with BehaviorSpace experiment."""
 function nlogo_source(model::AbstractBenchmarkModel)
     code = netlogo_code(model)
-    globals = tracked_globals(model)
-    nticks = n_ticks(model)
     min_px, max_px, min_py, max_py = world_dims(model)
     wrap_x, wrap_y = topology(model)
-    pre_cmds = strip(pre_setup_commands(model))
-
-    metrics = join(["    <metric>$g</metric>" for g in globals], "\n")
 
     # Section 1: Code
     buf = IOBuffer()
@@ -347,23 +379,7 @@ Circle -7500403 true true 0 0 300
 
     # Section 8: BehaviorSpace XML
     print(buf, SEP, "\n")
-    setup_block = if isempty(pre_cmds)
-        "random-seed randomSeed\nsetup"
-    else
-        "$pre_cmds\nrandom-seed randomSeed\nsetup"
-    end
-    print(buf, """<experiments>
-  <experiment name="benchmark" repetitions="1" runMetricsEveryStep="true">
-    <setup>$(setup_block)</setup>
-    <go>go</go>
-    <timeLimit steps="$(nticks)"/>
-$(metrics)
-    <enumeratedValueSet variable="randomSeed">
-      __SEEDS_PLACEHOLDER__
-    </enumeratedValueSet>
-  </experiment>
-</experiments>
-""")
+    print(buf, build_behaviorspace_xml(model; seed_placeholder=true))
 
     # Section 9: HubNet client (empty)
     print(buf, SEP, "\n")
@@ -459,14 +475,23 @@ function run_julia_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int
     compile_fn = getfield(NetLogo, :compile_model)
     runtime_fn = getfield(NetLogo, :create_runtime)
     call_fn    = getfield(NetLogo, Symbol("call!"))
+    run_commands_fn = getfield(NetLogo, Symbol("run_commands!"))
 
-    code = netlogo_code(model)
+    source = model isa FileBenchmarkModel ? full_nlogo_source(model) : netlogo_code(model)
+    source_path = model isa FileBenchmarkModel ? nlogo_path(model) : nothing
     globals = tracked_globals(model)
     ticks_n = n_ticks(model)
     min_px, max_px, min_py, max_py = world_dims(model)
     topology_mode = runtime_topology_mode(NetLogo, model)
+    pre_setup = strip(pre_setup_commands(model))
+    setup_proc = setup_command(model)
+    go_proc = go_command(model)
 
-    compiled = Base.invokelatest(compile_fn, code)
+    compiled = if source_path === nothing
+        Base.invokelatest(compile_fn, source)
+    else
+        Base.invokelatest(compile_fn, source; source_path=source_path)
+    end
     trajectories = TrajectoryData[]
 
     # Check if any tracked globals are reporter expressions (not stored globals)
@@ -490,7 +515,9 @@ function run_julia_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int
                         min_pxcor=min_px, max_pxcor=max_px,
                         min_pycor=min_py, max_pycor=max_py,
                         topology=topology_mode)
-        Base.invokelatest(call_fn, rt, "setup")
+        isempty(pre_setup) || Base.invokelatest(run_commands_fn, rt, pre_setup)
+        Base.invokelatest(run_commands_fn, rt, "random-seed $seed")
+        Base.invokelatest(call_fn, rt, setup_proc)
 
         tick_nums = Int[0]
         vals = Dict{String, Vector{Float64}}(
@@ -498,7 +525,7 @@ function run_julia_trajectories(model::AbstractBenchmarkModel, seeds::Vector{Int
             for g in globals)
 
         for t in 1:ticks_n
-            stopped = Base.invokelatest(call_fn, rt, "go")
+            stopped = Base.invokelatest(call_fn, rt, go_proc)
             push!(tick_nums, t)
             for g in globals
                 push!(vals[g], _read_tracked_global(rt, g, runresult_fn))
@@ -1328,8 +1355,11 @@ include("models/abtgc.jl")
 include("models/evolution_of_norms.jl")
 include("models/lassa_virus.jl")
 include("models/axelrod_cultural.jl")
+include("models/ethnocentrism.jl")
 include("models/mousetraps.jl")
 include("models/fire_benchmark.jl")
+include("models/daisyworld.jl")
+include("models/dla.jl")
 include("models/dla_simple.jl")
 include("models/boiling.jl")
 include("models/solid_diffusion.jl")

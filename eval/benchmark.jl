@@ -77,6 +77,9 @@ const MODELS = Dict(
     "firebenchmark"  => FireBenchmarkModel(),
     "lassavirus"     => LassaVirusModel(),
     "axelrodcultural" => AxelrodCulturalModel(),
+    "ethnocentrism"  => EthnocentrismModel(),
+    "daisyworld"     => DaisyworldModel(),
+    "dla"            => DLAModel(),
 )
 
 # Models too slow for full benchmarking — skip unless explicitly named
