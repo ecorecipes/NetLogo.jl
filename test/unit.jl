@@ -11,6 +11,8 @@ using Main.Test: @test, @testset
 using Main.HTTP
 using Main.JSON
 
+Base.include(@__MODULE__, joinpath(@__DIR__, "..", "vignettes", "_support.jl"))
+
 function register_extension!(registry)
   Main.NetLogo.register_primitive!(
     registry,
@@ -265,6 +267,32 @@ end
     @test pluto_gui(backend; width=320, height=240) isa NotebookGUI
   finally
     stop_web_gui!(backend)
+  end
+end
+
+@testset "unit: vignette parameter controls" begin
+  for (model_key, widget_name, widget_type, value, expected) in (
+    (:ants, "population", Main.NetLogo.SliderWidgetSpec, 150, 150),
+    (:fire, "density", Main.NetLogo.SliderWidgetSpec, 30, 30.0),
+  )
+    workspace_dir = mktempdir(prefix="netlogo-vignette-test-")
+    runtime = NetLogoVignetteSupport.benchmark_runtime(
+      NetLogoVignetteSupport.benchmark_model(model_key);
+      seed=11,
+      workspace_dir=workspace_dir,
+    )
+    try
+      @test any(widget -> widget isa widget_type && widget.variable == widget_name, runtime.model.interface_widgets)
+      session = gui_session(runtime)
+      set_gui_widget!(session, widget_name, value)
+      press_gui_button!(session, "setup")
+      @test runtime.world.observer.globals[NetLogo.canonical_name(widget_name)] == expected
+      if model_key == :ants
+        @test runresult(runtime, "count turtles") == expected
+      end
+    finally
+      isdir(workspace_dir) && rm(workspace_dir; recursive=true, force=true)
+    end
   end
 end
 
