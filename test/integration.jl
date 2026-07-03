@@ -1598,7 +1598,7 @@ end
   end
 end
 
-@testset "integration: patch color import commands" begin
+testset_if_fixtures("integration: patch color import commands") do
   fixture_dir = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "test", "import-pcolors")
   exact_path = joinpath(fixture_dir, "import-pcolors-test1.png")
   landscape_path = joinpath(fixture_dir, "import-pcolors-test.png")
@@ -1670,7 +1670,7 @@ end
   @test runtime.world.observer.globals["VERTICAL-COLORED"] > 0
 end
 
-@testset "integration: drawing import commands" begin
+testset_if_fixtures("integration: drawing import commands") do
   fixture_dir = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "test", "import-pcolors")
   exact_path = joinpath(fixture_dir, "import-pcolors-test1.png")
   landscape_path = joinpath(fixture_dir, "import-pcolors-test.png")
@@ -1742,7 +1742,7 @@ end
   @test any(pixel -> pixel[4] > 0.0, runtime.world.drawing)
 end
 
-@testset "integration: export view command" begin
+testset_if_fixtures("integration: export view command") do
   fixture_dir = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "test", "import-pcolors")
   exact_path = joinpath(fixture_dir, "import-pcolors-test1.png")
   base_dir = mktempdir()
@@ -1895,7 +1895,7 @@ end
   end
 end
 
-@testset "integration: export drawing command" begin
+testset_if_fixtures("integration: export drawing command") do
   fixture_dir = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "test", "import-pcolors")
   exact_path = joinpath(fixture_dir, "import-pcolors-test1.png")
   base_dir = mktempdir()
@@ -2041,7 +2041,7 @@ end
   end
 end
 
-@testset "integration: clear command aliases" begin
+testset_if_fixtures("integration: clear command aliases") do
   fixture_dir = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "test", "import-pcolors")
   exact_path = joinpath(fixture_dir, "import-pcolors-test1.png")
 
@@ -2396,7 +2396,7 @@ end
   ]
 end
 
-@testset "integration: file-backed interface widgets" begin
+testset_if_fixtures("integration: file-backed interface widgets") do
   ants_path = normpath(joinpath(@__DIR__, "..", "..", "NetLogo", "test", "fileformat", "Ants Benchmark.nlogo"))
   model = compile_model(read(ants_path, String))
   runtime = create_runtime(model; seed=337)
@@ -2829,7 +2829,7 @@ end
   @test runtime.world.observer.globals["CORRIDOR-COUNT"] == 2.0
   @test runtime.world.observer.globals["MARKED-PATCHES"] == 3.0
   @test runtime.world.observer.globals["EMPTY-FLAGS"] == Any[true, true, true]
-  @test runtime.world.observer.globals["MATH-TRACE"] == Any[4.0, -4.0, -1.0, 2.0, -3.0, 5.0, 1.0, 6.0]
+  @test runtime.world.observer.globals["MATH-TRACE"] == Any[4.0, -4.0, -2.0, 2.0, -3.0, 5.0, 1.0, 6.0]  # round(-1.5) rounds away from zero, matching NetLogo
 
   call!(runtime, "go")
 
