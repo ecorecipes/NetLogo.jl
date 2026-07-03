@@ -137,8 +137,8 @@ function register_extension!(registry::PrimitiveRegistry)
     (ctx, args) -> nw_biggest_maximal_cliques(ctx))
 
   register_primitive!(registry, "NW:MODULARITY", REPORTER,
-    reporter_syntax(ret=NumberType),
-    (ctx, args) -> nw_modularity(ctx))
+    reporter_syntax(right=[ListType], ret=NumberType),
+    (ctx, args) -> nw_modularity(ctx, args[1]))
 
   register_primitive!(registry, "NW:BICOMPONENT-CLUSTERS", REPORTER,
     reporter_syntax(ret=ListType),
@@ -381,7 +381,8 @@ function nw_weighted_distance_to(ctx::Context, target, weight_var::String)
   nc = get_nw_context(ctx)
   target isa Turtle || throw(LogoRuntimeError("nw:weighted-distance-to expected a turtle"))
   source = ctx.agent::Turtle
-  nw_dijkstra_distance(world, source, target, nc.linkset, nc.turtleset, weight_var)
+  dist = nw_dijkstra_distance(world, source, target, nc.linkset, nc.turtleset, weight_var)
+  isfinite(dist) ? dist : false
 end
 
 function nw_weighted_path_to(ctx::Context, target, weight_var::String)
@@ -434,7 +435,7 @@ function nw_dijkstra_distance(world::World, source::Turtle, target::Turtle, link
       end
     end
   end
-  false
+  Inf
 end
 
 function nw_dijkstra_path(world::World, source::Turtle, target::Turtle, linkset, turtleset, weight_var::String)
@@ -518,7 +519,7 @@ function nw_mean_weighted_path_length(ctx::Context, weight_var::String)
     for tgt in turtles
       src.id == tgt.id && continue
       d = nw_dijkstra_distance(world, src, tgt, nc.linkset, nc.turtleset, weight_var)
-      d === false && return false
+      isfinite(d) || return false
       total += d
       count += 1
     end
@@ -1157,22 +1158,45 @@ end
 
 # ── Modularity ───────────────────────────────────────────────────────
 
-function nw_modularity(ctx::Context)
-  g = build_nw_graph(ctx)
+function nw_modularity(ctx::Context, communities)
+  communities isa AbstractVector || throw(LogoRuntimeError("nw:modularity expected a list of turtle agentsets"))
+  g = get_cached_graph(ctx)
   n = g.n
   n == 0 && return 0.0
 
-  m = 0
-  for i in 1:n; m += length(g.adj[i]); end
-  m = m ÷ 2  # each edge counted twice
-  m == 0 && return 0.0
+  two_m = 0
+  for i in 1:n
+    two_m += length(g.adj[i])
+  end
+  two_m == 0 && return 0.0
 
-  # Community assignment: use current NW context turtleset for single community
-  # This is typically called after nw:set-snapshot or with partition already done
-  # NetLogo nw:modularity is actually not called standalone - check docs
-  # Actually nw:modularity is not a zero-arg reporter in the Java extension
-  # It's not listed in the NetLogo NW docs as standalone. Let's return 0.0 for now.
-  0.0
+  modularity = 0.0
+  for community in communities
+    community isa AgentSet || throw(LogoRuntimeError("nw:modularity expected a list of turtle agentsets"))
+    members = Int[]
+    member_set = Set{Int}()
+    for agent in live_agentset_members(community)
+      agent isa Turtle || throw(LogoRuntimeError("nw:modularity expected turtle agentsets"))
+      idx = get(g.id_to_idx, agent.id, 0)
+      idx == 0 && continue
+      idx in member_set && continue
+      push!(members, idx)
+      push!(member_set, idx)
+    end
+    isempty(members) && continue
+
+    internal_degree = 0
+    total_degree = 0
+    for idx in members
+      neighbors = g.adj[idx]
+      total_degree += length(neighbors)
+      for neighbor in neighbors
+        neighbor in member_set && (internal_degree += 1)
+      end
+    end
+    modularity += internal_degree / two_m - (total_degree / two_m)^2
+  end
+  modularity
 end
 
 # ── Biconnected components ───────────────────────────────────────────
@@ -1362,7 +1386,7 @@ function nw_weighted_closeness_centrality(ctx::Context, weight_var::String)
   for t in turtles
     t.id == source.id && continue
     d = nw_dijkstra_distance(world, source, t, nc.linkset, nc.turtleset, weight_var)
-    d < 0.0 && return 0.0  # unreachable
+    isfinite(d) || return 0.0
     total += d
   end
   total == 0.0 ? 0.0 : (n - 1) / total

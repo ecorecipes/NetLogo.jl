@@ -381,17 +381,7 @@ end
 fallback_parameter_widgets(::NetLogoCompare.AbstractBenchmarkModel) = NetLogo.InterfaceWidgetSpec[]
 go_button_source(benchmark_model) = NetLogoCompare.go_command(benchmark_model)
 
-function fallback_parameter_widgets(::NetLogoCompare.SIRModel)
-  specs = [
-    ("Population", "population", 25.0, 500.0, 25.0, 200.0),
-    ("Initial infected", "initial-infected", 1.0, 100.0, 1.0, 5.0),
-    ("Initial recovered", "initial-recovered", 0.0, 100.0, 1.0, 0.0),
-    ("Infection probability", "infection-probability", 0.01, 1.0, 0.01, 0.15),
-    ("Infection radius", "infection-radius", 0.5, 5.0, 0.1, 1.5),
-    ("Recovery days", "recovery-days", 1.0, 30.0, 1.0, 14.0),
-    ("Movement step", "movement-step", 0.0, 3.0, 0.1, 1.0),
-    ("Turn range", "turn-range", 0.0, 90.0, 1.0, 25.0),
-  ]
+function slider_parameter_widgets(specs)
   widgets = NetLogo.InterfaceWidgetSpec[]
   for (index, (display, variable, minimum, maximum, step, default)) in enumerate(specs)
     top = 128 + (index - 1) * 42
@@ -416,6 +406,29 @@ function fallback_parameter_widgets(::NetLogoCompare.SIRModel)
   widgets
 end
 
+function fallback_parameter_widgets(::NetLogoCompare.SIRModel)
+  slider_parameter_widgets([
+    ("Population", "population", 25.0, 500.0, 25.0, 200.0),
+    ("Initial infected", "initial-infected", 1.0, 100.0, 1.0, 5.0),
+    ("Initial recovered", "initial-recovered", 0.0, 100.0, 1.0, 0.0),
+    ("Infection probability", "infection-probability", 0.01, 1.0, 0.01, 0.15),
+    ("Infection radius", "infection-radius", 0.5, 5.0, 0.1, 1.5),
+    ("Recovery days", "recovery-days", 1.0, 30.0, 1.0, 14.0),
+    ("Movement step", "movement-step", 0.0, 3.0, 0.1, 1.0),
+    ("Turn range", "turn-range", 0.0, 90.0, 1.0, 25.0),
+  ])
+end
+
+fallback_parameter_widgets(::NetLogoCompare.AntsModel) = slider_parameter_widgets([
+  ("Population", "population", 1.0, 500.0, 1.0, 125.0),
+  ("Diffusion rate", "diffusion-rate", 0.0, 100.0, 1.0, 50.0),
+  ("Evaporation rate", "evaporation-rate", 0.0, 100.0, 1.0, 10.0),
+])
+
+fallback_parameter_widgets(::NetLogoCompare.FireModel) = slider_parameter_widgets([
+  ("Density", "density", 0.0, 100.0, 1.0, 57.0),
+])
+
 function parameter_widgets(compiled::NetLogo.ModelSpec, benchmark_model)
   widgets = source_parameter_widgets(compiled, benchmark_model)
   isempty(widgets) ? fallback_parameter_widgets(benchmark_model) : widgets
@@ -427,6 +440,24 @@ end
 
 function fallback_interface_globals(::NetLogoCompare.SIRModel)
   copy(SIR_DEFAULTS)
+end
+
+fallback_interface_globals(::NetLogoCompare.AntsModel) = Dict(
+  "POPULATION" => 125.0,
+  "DIFFUSION-RATE" => 50.0,
+  "EVAPORATION-RATE" => 10.0,
+)
+
+fallback_interface_globals(::NetLogoCompare.FireModel) = Dict(
+  "DENSITY" => 57.0,
+)
+
+function benchmark_parameter_globals(benchmark_model)
+  globals = Set{String}(keys(fallback_interface_globals(benchmark_model)))
+  metadata = source_interface_metadata(benchmark_model)
+  metadata === nothing || union!(globals, keys(metadata.defaults))
+  delete!(globals, "RANDOMSEED")
+  globals
 end
 
 function apply_default_interface_globals!(compiled::NetLogo.ModelSpec, benchmark_model)
@@ -482,9 +513,7 @@ function benchmark_runtime(benchmark_model; seed::Integer=1, workspace_dir::Unio
       source_path=NetLogoCompare.nlogo_path(benchmark_model),
     )
   else
-    parameter_globals = Set{String}(keys(source_interface_metadata(benchmark_model) === nothing ? Dict{String, Any}() : source_interface_metadata(benchmark_model).defaults))
-    delete!(parameter_globals, "RANDOMSEED")
-    NetLogo.compile_model(strip_setup_parameter_assignments(NetLogoCompare.netlogo_code(benchmark_model), parameter_globals))
+    NetLogo.compile_model(strip_setup_parameter_assignments(NetLogoCompare.netlogo_code(benchmark_model), benchmark_parameter_globals(benchmark_model)))
   end
   synthesize_standard_interface!(compiled, benchmark_model)
   runtime = NetLogo.create_runtime(

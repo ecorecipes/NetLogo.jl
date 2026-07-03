@@ -124,6 +124,15 @@ function tokenize(source::String)
         i += 1
         column += 1
       end
+      if i <= length(chars) && (chars[i] == 'e' || chars[i] == 'E')
+        i += 1; column += 1
+        if i <= length(chars) && (chars[i] == '+' || chars[i] == '-')
+          i += 1; column += 1
+        end
+        while i <= length(chars) && isdigit(chars[i])
+          i += 1; column += 1
+        end
+      end
       lexeme = join(chars[start_i:i - 1])
       push!(tokens, Token(NumberToken, lexeme, parse(Float64, lexeme), span_at(start_i, i - 1, start_line, start_column)))
     elseif c in ('<', '>', '!', '=', '+', '-', '*', '/', '^')

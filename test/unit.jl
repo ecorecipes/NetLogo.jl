@@ -2593,6 +2593,96 @@ end
   @test occursin(r"\d{2}:\d{2}:\d{2}\.\d{3} [AP]M \d{2}-\w{3}-\d{4}", date_str)
 end
 
+@testset "unit: lexer and runtime numeric regressions" begin
+  runtime = create_runtime(compile_model("""
+  to-report negative-scientific
+    report -1.5e-3
+  end
+  """); seed=17)
+
+  @test call!(runtime, "negative-scientific") == -1.5e-3
+  @test runresult(runtime, "round -0.5") == -1.0
+  @test runresult(runtime, "round -1.5") == -2.0
+  @test runresult(runtime, "round 0.5") == 1.0
+  @test runresult(runtime, "round 1.5") == 2.0
+
+  @test_throws LogoRuntimeError runresult(runtime, "random 0")
+  @test_throws LogoRuntimeError runresult(runtime, "random -5")
+  @test_throws LogoRuntimeError runresult(runtime, "random-float 0")
+  @test_throws LogoRuntimeError runresult(runtime, "random-float -2.0")
+
+  random_value = runresult(runtime, "random 5")
+  @test random_value isa Float64
+  @test 0.0 <= random_value < 5.0
+
+  random_float_value = runresult(runtime, "random-float 2.0")
+  @test random_float_value isa Float64
+  @test 0.0 <= random_float_value < 2.0
+end
+
+@testset "unit: rnd weighted-n-of-list preserves draw order" begin
+  runtime = create_runtime(compile_model("""
+  extensions [rnd]
+
+  to-report sample
+    report rnd:weighted-n-of-list 3 [10 20 30 40] [x -> x]
+  end
+  """); seed=23)
+
+  @test call!(runtime, "sample") == Any[30.0, 10.0, 20.0]
+end
+
+@testset "unit: nw modularity and weighted closeness regressions" begin
+  modularity_runtime = create_runtime(compile_model("""
+  extensions [nw]
+
+  to setup
+    clear-all
+    create-turtles 6
+    ask turtle 0 [ create-link-with turtle 1 create-link-with turtle 2 ]
+    ask turtle 1 [ create-link-with turtle 2 ]
+    ask turtle 2 [ create-link-with turtle 3 ]
+    ask turtle 3 [ create-link-with turtle 4 create-link-with turtle 5 ]
+    ask turtle 4 [ create-link-with turtle 5 ]
+    nw:set-context turtles links
+  end
+
+  to-report modularity-value
+    let communities (list (turtle-set turtle 0 turtle 1 turtle 2)
+                          (turtle-set turtle 3 turtle 4 turtle 5))
+    report nw:modularity communities
+  end
+  """); seed=29)
+
+  call!(modularity_runtime, "setup")
+  @test call!(modularity_runtime, "modularity-value") ≈ 5 / 14
+
+  closeness_runtime = create_runtime(compile_model("""
+  extensions [nw]
+  links-own [weight]
+
+  to setup
+    clear-all
+    create-turtles 3
+    ask turtle 0 [
+      create-link-with turtle 1 [
+        set weight 1
+      ]
+    ]
+    nw:set-context turtles links
+  end
+
+  to-report isolated-weighted-closeness
+    let c 0
+    ask turtle 2 [ set c nw:weighted-closeness-centrality "weight" ]
+    report c
+  end
+  """); seed=31)
+
+  call!(closeness_runtime, "setup")
+  @test call!(closeness_runtime, "isolated-weighted-closeness") == 0.0
+end
+
 @testset "unit: custom turtle shape loading" begin
   shapes_path = joinpath(dirname(dirname(@__DIR__)), "NetLogo", "shared", "resources", "main", "system", "defaultTurtleShapes.txt")
 

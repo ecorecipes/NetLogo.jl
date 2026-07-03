@@ -125,8 +125,6 @@ function pick_without_replacement(rng, weights::Vector{Float64}, count::Int)
     push!(selected, idx)
     active[idx] = -1.0
   end
-
-  sort!(selected)
   selected
 end
 

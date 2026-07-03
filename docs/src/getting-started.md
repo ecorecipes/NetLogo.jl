@@ -9,7 +9,7 @@ using Pkg
 Pkg.add(url="https://github.com/ecorecipes/NetLogo.jl")
 ```
 
-The package targets Julia 1.12.
+The package targets Julia 1.11 and later.
 
 ## A minimal embedded model
 

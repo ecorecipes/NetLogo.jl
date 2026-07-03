@@ -5866,7 +5866,20 @@ end
 
 rounded_world_coord(value) = round(Int, numeric(value))
 
-netlogo_round(value) = floor(numeric(value) + 0.5)
+netlogo_round(value) = round(numeric(value), RoundNearestTiesAway)
+
+function netlogo_random_limit(value)
+  number = numeric(value)
+  limit = Int(floor(number))
+  limit > 0 || throw(LogoRuntimeError("RANDOM expected a positive number, got $(logo_string(number)) instead."))
+  limit
+end
+
+function netlogo_random_float_limit(value)
+  number = numeric(value)
+  number > 0 || throw(LogoRuntimeError("RANDOM-FLOAT expected a positive number, got $(logo_string(number)) instead."))
+  number
+end
 
 function netlogo_sqrt(value)
   number = numeric(value)
@@ -9621,12 +9634,11 @@ function build_default_registry()
     (ctx, args) -> n_of(ctx.runtime.world.rng, args[1], args[2]; opname="up-to-n-of", up_to=true))
   register_primitive!(registry, "RANDOM", REPORTER, reporter_syntax(right=[NumberType], ret=NumberType),
     function (ctx, args)
-      limit = Int(floor(numeric(args[1])))
-      limit <= 0 && return 0.0
+      limit = netlogo_random_limit(args[1])
       Float64(rand(ctx.runtime.world.rng, 0:limit - 1))
     end)
   register_primitive!(registry, "RANDOM-FLOAT", REPORTER, reporter_syntax(right=[NumberType], ret=NumberType),
-    (ctx, args) -> rand(ctx.runtime.world.rng) * numeric(args[1]))
+    (ctx, args) -> rand(ctx.runtime.world.rng) * netlogo_random_float_limit(args[1]))
   register_primitive!(registry, "RANDOM-PXCOR", REPORTER, reporter_syntax(ret=NumberType),
     (ctx, args) -> random_patch_coord(ctx.runtime.world.rng, ctx.runtime.world.min_pxcor, ctx.runtime.world.max_pxcor))
   register_primitive!(registry, "RANDOM-PYCOR", REPORTER, reporter_syntax(ret=NumberType),
